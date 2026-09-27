@@ -183,17 +183,58 @@ class FakeResponse:
 
 
 class FakeSession:
-    """按调用顺序返回预置响应。
+    """按 URL（或 URL 前缀）匹配预置响应，避免单元测试碰真实网络。
+
+    匹配只看 URL，与请求方法无关：为某个 URL 声明的条目，GET 和 POST 都会命中它。
 
     routes 可以是：
       - dict: {url: FakeResponse | Exception | list[...]}，按 url 精确匹配
-      - list: [(url_prefix, FakeResponse | Exception), ...]，按前缀匹配，先到先得
-    匹配不到时抛 AssertionError，强迫测试显式声明所有请求。
+      - list: [(url_prefix, FakeResponse | Exception | list[...]), ...]，
+        按前缀匹配，先到先得（列表靠前的优先，**不是**最长前缀优先，
+        所以更具体的前缀要写在前面）
+
+    条目语义：
+      - 非列表条目（FakeResponse 或 Exception 实例）：每次调用都返回/抛出，次数不限。
+      - 列表条目：按**该路由自身**的调用顺序逐个消费，一次调用消费一个。
+        队列耗尽后继续调用会抛 AssertionError —— 说明被测代码比测试声明的多调了一次。
+        空列表 [] 在第一次调用时就抛 AssertionError。
+        注意 [resp] 的含义是「只允许调用一次」，不是「一次之后一直重复」。
+
+    匹配不到 URL 时同样抛 AssertionError，强迫测试显式声明所有请求。
+
+    routes 不会被就地修改：消费状态放在实例私有的 _queues 里，
+    因此同一个 routes 对象（fixture、模块级常量）可以安全地喂给多个 FakeSession。
+
+    记录的调用：
+      - calls: [(method, url), ...]，所有请求
+      - posts: [(url, data), ...]，仅 POST，data 即提交的表单
+
+    支持的 requests.Session 接口仅有：get、post、with 上下文管理器、headers。
+    用到 .cookies 之类时，要扩展的是这个替身，而不是被测代码。
     """
 
     def __init__(self, routes):
         self.routes = routes
         self.calls = []
+        self.posts = []
+        self.headers = {}
+        self._queues = {}
+
+    def _take(self, key, entry, method, url):
+        """取出本次调用该用的条目。
+
+        列表条目按调用顺序消费；队列耗尽（含空列表）时抛 AssertionError。
+        队列是按 key（精确 url 或匹配到的前缀）惰性复制的，绝不改动调用方传入的 routes。
+        """
+        if not isinstance(entry, list):
+            return entry
+        queue = self._queues.setdefault(key, list(entry))
+        if not queue:
+            raise AssertionError(
+                f"未预期的请求: {method} {url} —— "
+                f"该路由预置的响应已用尽，被测代码比测试声明的多调用了一次"
+            )
+        return queue.pop(0)
 
     def _pick(self, method, url):
         self.calls.append((method, url))
@@ -201,14 +242,12 @@ class FakeSession:
             entry = self.routes.get(url)
             if entry is None:
                 raise AssertionError(f"未预期的请求: {method} {url}")
-            if isinstance(entry, list):
-                entry = entry.pop(0) if len(entry) > 1 else entry[0]
-            return entry
+            return self._take(url, entry, method, url)
         for prefix, entry in self.routes:
             if url.startswith(prefix):
-                if isinstance(entry, list):
-                    entry = entry.pop(0) if len(entry) > 1 else entry[0]
-                return entry
+                # 队列按「匹配到的前缀」而非完整 url 记录：
+                # 前缀模式的 URL 每次都可能不同，但消费的是同一条队列。
+                return self._take(prefix, entry, method, url)
         raise AssertionError(f"未预期的请求: {method} {url}")
 
     def _do(self, method, url, **kwargs):
@@ -221,6 +260,8 @@ class FakeSession:
         return self._do("GET", url, **kwargs)
 
     def post(self, url, data=None, **kwargs):
+        # 先记账再匹配：即便这次请求未预期或抛了预置异常，也应留下记录
+        self.posts.append((url, data))
         return self._do("POST", url, **kwargs)
 
     def __enter__(self):
@@ -274,7 +315,99 @@ def test_fake_session_rejects_unexpected_url():
 
 
 def test_jsonp_wrapper():
-    assert jsonp('{"a":1}').endswith('({"a":1});')
+    wrapped = jsonp('{"a":1}')
+    assert wrapped.startswith("jQuery")
+    assert wrapped.endswith('({"a":1});')
+
+
+def test_non_list_entry_is_unlimited():
+    """非列表条目可以无限次命中——目前所有计划的测试都靠这个行为。"""
+    s = FakeSession({"http://a/": FakeResponse(text="hi")})
+    assert [s.get("http://a/").text for _ in range(3)] == ["hi", "hi", "hi"]
+    assert len(s.calls) == 3
+
+
+def test_queue_consumed_in_declaration_order():
+    s = FakeSession(
+        {"http://a/": [FakeResponse(text="first"), FakeResponse(text="second")]}
+    )
+    assert s.get("http://a/").text == "first"
+    assert s.get("http://a/").text == "second"
+
+
+def test_queue_exhaustion_raises():
+    """反封号保证：被测代码多调一次必须炸，而不是默默重复最后一个响应。"""
+    s = FakeSession({"http://a/": [FakeResponse(text="only")]})
+    assert s.post("http://a/", data={"x": 1}).text == "only"
+    with pytest.raises(AssertionError, match="用尽"):
+        s.post("http://a/", data={"x": 2})
+
+
+def test_empty_queue_raises_on_first_call():
+    s = FakeSession({"http://a/": []})
+    with pytest.raises(AssertionError, match="用尽"):
+        s.get("http://a/")
+
+
+def test_routes_not_mutated_by_consumption():
+    """同一个 routes 对象要能安全地喂给多个 FakeSession。"""
+    routes = {"http://a/": [FakeResponse(text="first"), FakeResponse(text="second")]}
+
+    s1 = FakeSession(routes)
+    assert s1.get("http://a/").text == "first"
+    assert s1.get("http://a/").text == "second"
+
+    s2 = FakeSession(routes)
+    assert s2.get("http://a/").text == "first"
+
+
+def test_prefix_route_matches_longer_url():
+    """前缀模式：测试声明的是前缀，实际 URL 带着没声明过的查询串也能命中。"""
+    s = FakeSession([("http://a/api/", FakeResponse(text="ok"))])
+    assert s.get("http://a/api/login?t=1700000000000&x=1").text == "ok"
+
+
+def test_prefix_queue_keyed_by_prefix_not_full_url():
+    """前缀模式下每次 URL 都不同，消费的必须是同一条队列。"""
+    entry = [FakeResponse(text="first"), FakeResponse(text="second")]
+    snapshot = list(entry)
+    s = FakeSession([("http://a/api/", entry)])
+    assert s.get("http://a/api/one").text == "first"
+    assert s.get("http://a/api/two").text == "second"
+    # 调用方传入的列表被完整消费过，但不该被改动
+    assert entry == snapshot
+    assert len(entry) == 2
+
+
+def test_post_payload_recorded():
+    """提交的表单字段是本项目风险最高的未知项（Task 12 专门要修正字段名），必须可断言。"""
+    s = FakeSession({"http://a/": FakeResponse(text="ok")})
+    s.post("http://a/", data={"username": "u", "password": "p"})
+    assert s.posts == [("http://a/", {"username": "u", "password": "p"})]
+    # calls 仍是二元组，计划的后续测试依赖这个形状
+    assert s.calls == [("POST", "http://a/")]
+
+
+def test_context_manager_does_not_swallow_exceptions():
+    with FakeSession({"http://a/": FakeResponse(text="hi")}) as s:
+        assert s.get("http://a/").text == "hi"
+    with pytest.raises(AssertionError):
+        with FakeSession({}) as s:
+            s.get("http://nope/")
+
+
+def test_headers_is_usable_dict():
+    s = FakeSession({})
+    s.headers["User-Agent"] = "x"
+    assert s.headers == {"User-Agent": "x"}
+
+
+def test_raise_for_status_at_boundaries():
+    for code in (200, 399):
+        FakeResponse(status_code=code).raise_for_status()
+    for code in (400, 500):
+        with pytest.raises(requests.HTTPError):
+            FakeResponse(status_code=code).raise_for_status()
 ```
 
 - [ ] **Step 4: 跑测试**
@@ -284,7 +417,7 @@ cd "/c/Users/De Ronaldinho/campus-net"
 python -m pytest tests/test_fakes.py -v
 ```
 
-Expected: 4 passed
+Expected: 15 passed
 
 - [ ] **Step 5: Commit**
 
