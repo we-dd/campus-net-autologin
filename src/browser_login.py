@@ -766,6 +766,14 @@ def _build_driver(cfg: Config, profile: str):
         factory = webdriver.Edge
 
     options.add_argument(f"--user-data-dir={profile}")
+
+    # 绕开系统代理。这不是可选优化，是必须的：
+    # 校园网把你踢下线时，AC 会在网络层把 HTTP 请求重定向到登录页；但如果浏览器
+    # 把请求交给本地代理（127.0.0.1:7897），代理自己连不上上游，浏览器只会显示
+    # "代理服务器出现问题"，校园门户的重定向根本不会发生，我们也就永远等不到登录表单。
+    # 只有直连，请求才会真的走到网络上、被 AC 拦到。
+    # 只作用于这个临时配置的浏览器实例，不影响平时用的浏览器。
+    options.add_argument("--no-proxy-server")
     # 全新的配置目录会触发首启流程和"选择搜索引擎"页面，它们会盖住登录页，
     # 让后面的元素采集全部落空。
     options.add_argument("--no-first-run")

@@ -39,6 +39,12 @@ def _notify(title: str, message: str) -> None:
 
 def _new_session() -> requests.Session:
     s = requests.Session()
+    # 绕开系统代理。
+    # requests 在 Windows 上会去读注册表里的系统代理设置（IE/WinINET 那一套），
+    # 而这台机器上开着本地代理（127.0.0.1:7897，Clash 之类）。
+    # 我们要判断的是"校园网认没认证"，不是"代理通不通"。
+    # 走代理的话，校园网断线时探测会被代理吞掉，判定结果不再反映真实网络状态。
+    s.trust_env = False
     s.headers["User-Agent"] = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
