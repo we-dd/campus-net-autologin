@@ -477,6 +477,9 @@ Create: `tests/test_logsetup.py`
 
 ```python
 import logging
+import logging.handlers
+
+import pytest
 
 from src.logsetup import init
 
@@ -507,6 +510,35 @@ def test_init_does_not_truncate_existing_log(tmp_path):
         h.flush()
     content = log_file.read_text(encoding="utf-8")
     assert "上一轮的记录" in content and "本轮" in content
+
+
+@pytest.fixture(scope="module")
+def shared_log(tmp_path_factory):
+    """下面两个用例共用同一个日志路径：第二个要验证“同一路径能再次 init”。"""
+    return str(tmp_path_factory.mktemp("shared") / "shared.log")
+
+
+def test_init_attaches_handlers(shared_log):
+    before = len(logging.getLogger().handlers)
+    init(shared_log, "INFO")
+    assert len(logging.getLogger().handlers) == before + 2
+
+
+def test_conftest_cleanup_is_not_cosmetic(shared_log):
+    """依赖上一个用例：它用同一个路径调过 init()。
+
+    1) 那个用例挂上去的 handler 必须已被 conftest 的 fixture 摘掉，否则会累积；
+    2) _configured 里的路径也必须一并还原，否则这里的 init() 会被短路、一个
+       handler 都不加。第 2 条是关键：只摘 handler 不还原路径，清理就是装样子的，
+       而这条断言正是为了不让以后有人把那段 fixture 当噪音删掉。
+    """
+    leftovers = [h for h in logging.getLogger().handlers
+                 if isinstance(h, logging.handlers.RotatingFileHandler)]
+    assert leftovers == []
+
+    before = len(logging.getLogger().handlers)
+    init(shared_log, "INFO")
+    assert len(logging.getLogger().handlers) == before + 2
 
 
 # 导入时（收集阶段，还没有用例跑过）先记下 root 的原始级别
@@ -592,7 +624,7 @@ def init(log_path: str, level: str = "INFO") -> None:
 python -m pytest tests/test_logsetup.py -v
 ```
 
-Expected: 5 passed
+Expected: 7 passed
 
 - [ ] **Step 5: Commit**
 
@@ -619,7 +651,7 @@ import logging
 
 import pytest
 
-from src.config import DEFAULT_PROBE_URLS, Config, ConfigError, load
+from src.config import DEFAULT_PROBE_URLS, Config, ConfigError, _KNOWN_KEYS, load
 
 
 def write(tmp_path, obj):
@@ -753,6 +785,16 @@ def test_valid_probe_urls_are_kept(tmp_path):
     assert cfg.probe_urls[0]["note"] == "自定义键保留"
 
 
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_expect_text_raises(tmp_path, blank):
+    """空字符串在任何响应里都能匹配上（"" in text 恒为真），会让这条探测永远
+    判成已在线，工具就再也不登录了——所以必须拦住，而不是当成没写。"""
+    with pytest.raises(ConfigError, match="expect_text"):
+        load(write(tmp_path, minimal(
+            probe_urls=[{"url": "http://x/", "expect_text": blank}]
+        )))
+
+
 # --- 以下为评审补丁新增：文件编码 --------------------------------------------
 
 
@@ -784,6 +826,17 @@ def test_bool_for_int_field_raises(tmp_path, field):
         load(write(tmp_path, minimal(**{field: True})))
 
 
+def test_float_for_int_field_says_drop_the_point(tmp_path):
+    """写 2.5 秒是个很自然的手误，报错要给出可操作的说法，而不是只说类型不对。"""
+    with pytest.raises(ConfigError, match="小数"):
+        load(write(tmp_path, minimal(probe_timeout=2.5)))
+
+
+def test_null_for_int_field_reads_as_blank_value(tmp_path):
+    with pytest.raises(ConfigError, match="空值"):
+        load(write(tmp_path, minimal(probe_timeout=None)))
+
+
 def test_portal_is_stripped(tmp_path):
     cfg = load(write(tmp_path, minimal(portal="  http://10.71.29.181  ")))
     assert cfg.portal == "http://10.71.29.181"
@@ -796,6 +849,16 @@ def test_portal_is_stripped(tmp_path):
 def test_url_fields_require_scheme(tmp_path, field):
     with pytest.raises(ConfigError, match=field):
         load(write(tmp_path, minimal(**{field: "10.71.29.181/eportal"})))
+
+
+@pytest.mark.parametrize(
+    "field", ["login_page_url", "login_submit_url", "captcha_url"]
+)
+def test_blank_url_field_error_explains_the_default(tmp_path, field):
+    """留空的语义变了（过去悄悄回退成推导值，现在直接报错），所以报错里必须
+    说清楚“想用默认值就别写这一项”，否则用户会卡在“那我要怎么用默认值”。"""
+    with pytest.raises(ConfigError, match="自动推导"):
+        load(write(tmp_path, minimal(**{field: ""})))
 
 
 # --- 以下为评审补丁新增：log_level 与拼错的键 --------------------------------
@@ -830,6 +893,21 @@ def test_known_keys_do_not_warn(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="src.config"):
         load(write(tmp_path, minimal(log_level="DEBUG", probe_timeout=9)))
     assert caplog.text == ""
+
+
+def test_known_keys_are_exactly_the_documented_options():
+    """钉住这份名单。
+
+    _KNOWN_KEYS 是从 Config 的字段推导的：将来给 Config 加了字段（或改了名）却
+    没想清楚要不要让用户配，这里就会失败，逼着人来改一次——而不是让用户收到
+    一条假的“无法识别的配置项”警告（那种错没人会注意到）。
+    """
+    assert _KNOWN_KEYS == {
+        "username", "portal", "probe_urls", "log_level",
+        "captcha_max_retry", "run_max_fail", "window_hours",
+        "window_max_fail", "probe_timeout",
+        "login_page_url", "login_submit_url", "captcha_url",
+    }
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -862,7 +940,7 @@ import difflib
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -888,16 +966,10 @@ _OPTIONAL_URL_FIELDS = ("login_page_url", "login_submit_url", "captcha_url")
 # 轮转日志；FATAL / WARN 这类别名也不放进来，用户没有理由手写它们。
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
-# 配置文件里允许出现的键，用于识别拼错的键（见 _warn_unknown_keys）。
-_KNOWN_KEYS = frozenset(
-    ("username", "portal", "probe_urls", "log_level")
-    + _INT_FIELDS
-    + _OPTIONAL_URL_FIELDS
-)
-
 # bool 要在 int 前面判断：bool 是 int 的子类，否则 true 会被当成 1。
 _TYPE_NAMES = ((bool, "布尔值"), (str, "字符串"), (int, "整数"),
-               (list, "列表"), (dict, "对象"))
+               (float, "小数"), (list, "列表"), (dict, "对象"),
+               (type(None), "空值"))
 
 
 class ConfigError(Exception):
@@ -928,6 +1000,16 @@ class Config:
     samples_dir: str = ""
 
 
+# 配置文件里允许出现的键，用于识别拼错的键（见 _warn_unknown_keys）。
+# 直接从 Config 的字段推导：将来给 Config 加了字段却忘了同步这里，用户每次运行
+# 都会收到一条假的“无法识别的配置项”警告，而那种错很难自己发现。
+# 排除的这几个是 load() 按配置文件位置算出来的派生路径，不该写进配置文件。
+_DERIVED_PATH_FIELDS = frozenset(
+    {"base_dir", "secret_path", "state_path", "log_path", "samples_dir"}
+)
+_KNOWN_KEYS = frozenset(f.name for f in fields(Config)) - _DERIVED_PATH_FIELDS
+
+
 def _type_name(value: Any) -> str:
     for typ, name in _TYPE_NAMES:
         if isinstance(value, typ):
@@ -943,8 +1025,11 @@ def _show(value: Any) -> str:
 
 def _bad_type(where: str, key: str, expected: str, value: Any) -> ConfigError:
     msg = f"{where} 字段 {key} 期望{expected}，实际是{_type_name(value)} {_show(value)}"
-    if expected == "整数" and isinstance(value, str):
-        msg += "（数字不要加引号）"
+    if expected == "整数":
+        if isinstance(value, str):
+            msg += "（数字不要加引号）"
+        elif isinstance(value, float):
+            msg += "（去掉小数点）"
     return ConfigError(msg)
 
 
@@ -957,12 +1042,14 @@ def _require_str(data: dict, key: str, where: str) -> str:
     return value
 
 
-def _check_url(where: str, key: str, value: str) -> str:
+def _check_url(where: str, key: str, value: str, derivable: bool = False) -> str:
     value = value.strip()
     if not value.startswith(("http://", "https://")):
-        raise ConfigError(
-            f"{where} 字段 {key} 必须是 http(s):// 开头的地址，实际是 {_show(value)}"
-        )
+        msg = f"{where} 字段 {key} 必须是 http(s):// 开头的地址，实际是 {_show(value)}"
+        if derivable:
+            # 留空不再回退了，所以得告诉用户“想用默认值就别写这一项”
+            msg += "（不写这一项就会按 portal 自动推导）"
+        raise ConfigError(msg)
     return value
 
 
@@ -973,7 +1060,8 @@ def _validate_probe_urls(urls: list, where: str) -> list[dict[str, Any]]:
 
     cleaned: list[dict[str, Any]] = []
     for index, entry in enumerate(urls, start=1):
-        label = f"{where} 字段 probe_urls[{index}]"
+        # 「字段」由 _bad_type 拼，这里不要再带一个，否则会出现“字段 xxx 字段 yyy”
+        label = f"{where} probe_urls[{index}]"
 
         if not isinstance(entry, dict):
             raise ConfigError(
@@ -1008,6 +1096,12 @@ def _validate_probe_urls(urls: list, where: str) -> list[dict[str, Any]]:
             text = entry["expect_text"]
             if not isinstance(text, str):
                 raise _bad_type(label, "expect_text", "字符串", text)
+            if not text.strip():
+                # 空字符串在任何响应里都能匹配上，这条探测会永远判成“已在线”
+                raise ConfigError(
+                    f"{label} 的 expect_text 不能是空白，"
+                    "空字符串在任何响应里都能匹配上，会让这条探测永远判成已在线"
+                )
         else:
             status = entry["expect_status"]
             if isinstance(status, bool) or not isinstance(status, int):
@@ -1094,7 +1188,9 @@ def load(path: str = "config.json") -> Config:
 
     for key in _OPTIONAL_URL_FIELDS:
         if key in data:
-            kwargs[key] = _check_url(where, key, _require_str(data, key, where))
+            kwargs[key] = _check_url(
+                where, key, _require_str(data, key, where), derivable=True
+            )
 
     _warn_unknown_keys(data, where)
 
@@ -1119,7 +1215,7 @@ def load(path: str = "config.json") -> Config:
 python -m pytest tests/test_config.py -v
 ```
 
-Expected: 44 passed
+Expected: 52 passed
 
 - [ ] **Step 5: Commit**
 
@@ -2971,9 +3067,11 @@ def main(argv=None) -> int:
     # 计划任务跑起来时 stderr 是被丢掉的，不先开日志就等于什么都没留下。
     # 正常情况下 cfg.log_path 与这个路径相同，下面的第二次 init 会被短路径判断短路掉。
     fallback_log = os.path.join(os.path.dirname(os.path.abspath(cfg_path)), "campus-net.log")
-    logsetup.init(fallback_log, "DEBUG" if args.verbose else "INFO")
 
+    # 这次的 init 也要包在 try 里：日志目录不可写（只读盘、权限、路径某段是文件）
+    # 同样会抛 OSError，那不该变成栈回溯和退出码 1。
     try:
+        logsetup.init(fallback_log, "DEBUG" if args.verbose else "INFO")
         cfg = load(cfg_path)
     except (ConfigError, OSError) as e:
         log.error("配置错误: %s", e)

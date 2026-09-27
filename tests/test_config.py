@@ -3,7 +3,7 @@ import logging
 
 import pytest
 
-from src.config import DEFAULT_PROBE_URLS, Config, ConfigError, load
+from src.config import DEFAULT_PROBE_URLS, Config, ConfigError, _KNOWN_KEYS, load
 
 
 def write(tmp_path, obj):
@@ -137,6 +137,16 @@ def test_valid_probe_urls_are_kept(tmp_path):
     assert cfg.probe_urls[0]["note"] == "自定义键保留"
 
 
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_expect_text_raises(tmp_path, blank):
+    """空字符串在任何响应里都能匹配上（"" in text 恒为真），会让这条探测永远
+    判成已在线，工具就再也不登录了——所以必须拦住，而不是当成没写。"""
+    with pytest.raises(ConfigError, match="expect_text"):
+        load(write(tmp_path, minimal(
+            probe_urls=[{"url": "http://x/", "expect_text": blank}]
+        )))
+
+
 # --- 以下为评审补丁新增：文件编码 --------------------------------------------
 
 
@@ -168,6 +178,17 @@ def test_bool_for_int_field_raises(tmp_path, field):
         load(write(tmp_path, minimal(**{field: True})))
 
 
+def test_float_for_int_field_says_drop_the_point(tmp_path):
+    """写 2.5 秒是个很自然的手误，报错要给出可操作的说法，而不是只说类型不对。"""
+    with pytest.raises(ConfigError, match="小数"):
+        load(write(tmp_path, minimal(probe_timeout=2.5)))
+
+
+def test_null_for_int_field_reads_as_blank_value(tmp_path):
+    with pytest.raises(ConfigError, match="空值"):
+        load(write(tmp_path, minimal(probe_timeout=None)))
+
+
 def test_portal_is_stripped(tmp_path):
     cfg = load(write(tmp_path, minimal(portal="  http://10.71.29.181  ")))
     assert cfg.portal == "http://10.71.29.181"
@@ -180,6 +201,16 @@ def test_portal_is_stripped(tmp_path):
 def test_url_fields_require_scheme(tmp_path, field):
     with pytest.raises(ConfigError, match=field):
         load(write(tmp_path, minimal(**{field: "10.71.29.181/eportal"})))
+
+
+@pytest.mark.parametrize(
+    "field", ["login_page_url", "login_submit_url", "captcha_url"]
+)
+def test_blank_url_field_error_explains_the_default(tmp_path, field):
+    """留空的语义变了（过去悄悄回退成推导值，现在直接报错），所以报错里必须
+    说清楚“想用默认值就别写这一项”，否则用户会卡在“那我要怎么用默认值”。"""
+    with pytest.raises(ConfigError, match="自动推导"):
+        load(write(tmp_path, minimal(**{field: ""})))
 
 
 # --- 以下为评审补丁新增：log_level 与拼错的键 --------------------------------
@@ -214,3 +245,18 @@ def test_known_keys_do_not_warn(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="src.config"):
         load(write(tmp_path, minimal(log_level="DEBUG", probe_timeout=9)))
     assert caplog.text == ""
+
+
+def test_known_keys_are_exactly_the_documented_options():
+    """钉住这份名单。
+
+    _KNOWN_KEYS 是从 Config 的字段推导的：将来给 Config 加了字段（或改了名）却
+    没想清楚要不要让用户配，这里就会失败，逼着人来改一次——而不是让用户收到
+    一条假的“无法识别的配置项”警告（那种错没人会注意到）。
+    """
+    assert _KNOWN_KEYS == {
+        "username", "portal", "probe_urls", "log_level",
+        "captcha_max_retry", "run_max_fail", "window_hours",
+        "window_max_fail", "probe_timeout",
+        "login_page_url", "login_submit_url", "captcha_url",
+    }

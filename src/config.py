@@ -15,7 +15,7 @@ import difflib
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -41,16 +41,10 @@ _OPTIONAL_URL_FIELDS = ("login_page_url", "login_submit_url", "captcha_url")
 # 轮转日志；FATAL / WARN 这类别名也不放进来，用户没有理由手写它们。
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
-# 配置文件里允许出现的键，用于识别拼错的键（见 _warn_unknown_keys）。
-_KNOWN_KEYS = frozenset(
-    ("username", "portal", "probe_urls", "log_level")
-    + _INT_FIELDS
-    + _OPTIONAL_URL_FIELDS
-)
-
 # bool 要在 int 前面判断：bool 是 int 的子类，否则 true 会被当成 1。
 _TYPE_NAMES = ((bool, "布尔值"), (str, "字符串"), (int, "整数"),
-               (list, "列表"), (dict, "对象"))
+               (float, "小数"), (list, "列表"), (dict, "对象"),
+               (type(None), "空值"))
 
 
 class ConfigError(Exception):
@@ -81,6 +75,16 @@ class Config:
     samples_dir: str = ""
 
 
+# 配置文件里允许出现的键，用于识别拼错的键（见 _warn_unknown_keys）。
+# 直接从 Config 的字段推导：将来给 Config 加了字段却忘了同步这里，用户每次运行
+# 都会收到一条假的“无法识别的配置项”警告，而那种错很难自己发现。
+# 排除的这几个是 load() 按配置文件位置算出来的派生路径，不该写进配置文件。
+_DERIVED_PATH_FIELDS = frozenset(
+    {"base_dir", "secret_path", "state_path", "log_path", "samples_dir"}
+)
+_KNOWN_KEYS = frozenset(f.name for f in fields(Config)) - _DERIVED_PATH_FIELDS
+
+
 def _type_name(value: Any) -> str:
     for typ, name in _TYPE_NAMES:
         if isinstance(value, typ):
@@ -96,8 +100,11 @@ def _show(value: Any) -> str:
 
 def _bad_type(where: str, key: str, expected: str, value: Any) -> ConfigError:
     msg = f"{where} 字段 {key} 期望{expected}，实际是{_type_name(value)} {_show(value)}"
-    if expected == "整数" and isinstance(value, str):
-        msg += "（数字不要加引号）"
+    if expected == "整数":
+        if isinstance(value, str):
+            msg += "（数字不要加引号）"
+        elif isinstance(value, float):
+            msg += "（去掉小数点）"
     return ConfigError(msg)
 
 
@@ -110,12 +117,14 @@ def _require_str(data: dict, key: str, where: str) -> str:
     return value
 
 
-def _check_url(where: str, key: str, value: str) -> str:
+def _check_url(where: str, key: str, value: str, derivable: bool = False) -> str:
     value = value.strip()
     if not value.startswith(("http://", "https://")):
-        raise ConfigError(
-            f"{where} 字段 {key} 必须是 http(s):// 开头的地址，实际是 {_show(value)}"
-        )
+        msg = f"{where} 字段 {key} 必须是 http(s):// 开头的地址，实际是 {_show(value)}"
+        if derivable:
+            # 留空不再回退了，所以得告诉用户“想用默认值就别写这一项”
+            msg += "（不写这一项就会按 portal 自动推导）"
+        raise ConfigError(msg)
     return value
 
 
@@ -126,7 +135,8 @@ def _validate_probe_urls(urls: list, where: str) -> list[dict[str, Any]]:
 
     cleaned: list[dict[str, Any]] = []
     for index, entry in enumerate(urls, start=1):
-        label = f"{where} 字段 probe_urls[{index}]"
+        # 「字段」由 _bad_type 拼，这里不要再带一个，否则会出现“字段 xxx 字段 yyy”
+        label = f"{where} probe_urls[{index}]"
 
         if not isinstance(entry, dict):
             raise ConfigError(
@@ -161,6 +171,12 @@ def _validate_probe_urls(urls: list, where: str) -> list[dict[str, Any]]:
             text = entry["expect_text"]
             if not isinstance(text, str):
                 raise _bad_type(label, "expect_text", "字符串", text)
+            if not text.strip():
+                # 空字符串在任何响应里都能匹配上，这条探测会永远判成“已在线”
+                raise ConfigError(
+                    f"{label} 的 expect_text 不能是空白，"
+                    "空字符串在任何响应里都能匹配上，会让这条探测永远判成已在线"
+                )
         else:
             status = entry["expect_status"]
             if isinstance(status, bool) or not isinstance(status, int):
@@ -247,7 +263,9 @@ def load(path: str = "config.json") -> Config:
 
     for key in _OPTIONAL_URL_FIELDS:
         if key in data:
-            kwargs[key] = _check_url(where, key, _require_str(data, key, where))
+            kwargs[key] = _check_url(
+                where, key, _require_str(data, key, where), derivable=True
+            )
 
     _warn_unknown_keys(data, where)
 

@@ -1,4 +1,7 @@
 import logging
+import logging.handlers
+
+import pytest
 
 from src.logsetup import init
 
@@ -29,6 +32,35 @@ def test_init_does_not_truncate_existing_log(tmp_path):
         h.flush()
     content = log_file.read_text(encoding="utf-8")
     assert "上一轮的记录" in content and "本轮" in content
+
+
+@pytest.fixture(scope="module")
+def shared_log(tmp_path_factory):
+    """下面两个用例共用同一个日志路径：第二个要验证“同一路径能再次 init”。"""
+    return str(tmp_path_factory.mktemp("shared") / "shared.log")
+
+
+def test_init_attaches_handlers(shared_log):
+    before = len(logging.getLogger().handlers)
+    init(shared_log, "INFO")
+    assert len(logging.getLogger().handlers) == before + 2
+
+
+def test_conftest_cleanup_is_not_cosmetic(shared_log):
+    """依赖上一个用例：它用同一个路径调过 init()。
+
+    1) 那个用例挂上去的 handler 必须已被 conftest 的 fixture 摘掉，否则会累积；
+    2) _configured 里的路径也必须一并还原，否则这里的 init() 会被短路、一个
+       handler 都不加。第 2 条是关键：只摘 handler 不还原路径，清理就是装样子的，
+       而这条断言正是为了不让以后有人把那段 fixture 当噪音删掉。
+    """
+    leftovers = [h for h in logging.getLogger().handlers
+                 if isinstance(h, logging.handlers.RotatingFileHandler)]
+    assert leftovers == []
+
+    before = len(logging.getLogger().handlers)
+    init(shared_log, "INFO")
+    assert len(logging.getLogger().handlers) == before + 2
 
 
 # 导入时（收集阶段，还没有用例跑过）先记下 root 的原始级别
