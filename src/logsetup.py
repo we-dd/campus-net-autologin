@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import os
+import sys
 
 _FORMAT = "%(asctime)s %(levelname)-7s %(name)s | %(message)s"
 _configured: set[str] = set()
@@ -36,8 +37,12 @@ def init(log_path: str, level: str = "INFO") -> None:
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
-    sh = logging.StreamHandler()
-    sh.setFormatter(fmt)
-    root.addHandler(sh)
+    # 计划任务里用 pythonw.exe 跑（不弹黑窗口），此时 sys.stderr 是 None。
+    # StreamHandler 拿不到 stream，写第一条日志就会抛 AttributeError。
+    # 没有控制台就只写文件。
+    if sys.stderr is not None:
+        sh = logging.StreamHandler()
+        sh.setFormatter(fmt)
+        root.addHandler(sh)
 
     _configured.add(key)
