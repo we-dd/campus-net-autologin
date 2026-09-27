@@ -2,7 +2,7 @@
   "username": "你的学号",
   "portal": "http://10.71.29.181",
 
-  "browser": "edge",
+  "browser": "chrome",
   "headless": false,
   "login_url": "",
 
@@ -25,5 +25,13 @@
     }
   ],
 
-  "selectors": {}
+  "selectors": {
+    "username": "#nameInput",
+    "password": "input[type=password]",
+    "captcha_input": "input[name=captcha_code]:not([type=hidden])",
+    "captcha_image": "img.code-img",
+    "captcha_reload": "a.code-reload-content",
+    "agree": "input[type=checkbox]",
+    "submit": "#submitBtn"
+  }
 }
