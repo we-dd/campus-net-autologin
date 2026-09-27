@@ -1227,17 +1227,116 @@ def test_fill_keeps_stale_retryable():
         browser_login._fill(_El(), "value")
 
 
-def test_solving_a_captcha_keeps_stale_retryable():
-    """截图时图片失效也要重来一轮，不能当成"识别失败"——那会让 decide_submit
-    跳过提交，等于白费一轮（而这一轮本来什么都没提交）。"""
+def _recorder(sink):
+    """假的 captcha.recognize：把收到的图片字节记进 sink，并回一个非空结果。"""
+    def _fake(png_bytes):
+        sink["bytes"] = png_bytes
+        return "abcd"
+    return _fake
 
-    class _El:
+
+def test_solving_a_captcha_keeps_stale_retryable():
+    """取图时图片失效也要重来一轮，不能当成"识别失败"——那会让 decide_submit
+    跳过提交，等于白费一轮（而这一轮本来什么都没提交）。
+
+    两条取图路径都要保持这一点：canvas 主路径和元素截图兜底路径。
+    """
+
+    class _StaleDriver:
+        def execute_script(self, *a, **kw):
+            raise StaleElementReferenceException("stale")
+
+    class _ElCanvasStale:
+        parent = _StaleDriver()
+
+        @property
+        def screenshot_as_png(self):        # 不该走到这里
+            raise AssertionError("canvas 抛 stale 后不应再退回截图")
+
+    class _ElShotStale:
+        class parent:                        # canvas 不可用，走兜底
+            def execute_script(self, *a, **kw):
+                raise WebDriverException("canvas 不支持")
+
         @property
         def screenshot_as_png(self):
             raise StaleElementReferenceException("stale")
 
     with pytest.raises(StaleElementReferenceException):
-        browser_login._solve_captcha(_El())
+        browser_login._solve_captcha(_ElCanvasStale())
+    with pytest.raises(StaleElementReferenceException):
+        browser_login._solve_captcha(_ElShotStale())
+
+
+def test_captcha_prefers_native_resolution(monkeypatch):
+    """主路径：用 canvas 按原生尺寸取图，而不是退化的元素截图。
+
+    实测同一张图元素截图是 100x35、原生是 160x70，差约 3.2 倍像素。
+    这里断言：canvas 给了数据就用 canvas 的，且解出来的字节原样交给 OCR。
+    """
+    import base64 as _b64
+
+    payload = b"\x89PNG\r\n\x1a\n native-resolution-bytes"
+    data_url = "data:image/png;base64," + _b64.b64encode(payload).decode()
+
+    seen = {}
+
+    class _Driver:
+        def execute_script(self, script, el):
+            return data_url
+
+    class _El:
+        parent = _Driver()
+
+        @property
+        def screenshot_as_png(self):
+            raise AssertionError("canvas 可用时不该退回元素截图")
+
+    monkeypatch.setattr(browser_login.captcha, "recognize", _recorder(seen))
+    browser_login._solve_captcha(_El())
+    assert seen["bytes"] == payload
+
+
+def test_captcha_falls_back_to_element_screenshot(monkeypatch):
+    """兜底：canvas 不可用时（抛 WebDriverException）退回元素截图，不能让整轮崩掉。"""
+    shot = b"\x89PNG\r\n\x1a\n element-shot-bytes"
+    seen = {}
+
+    class _Driver:
+        def execute_script(self, *a, **kw):
+            raise WebDriverException("没有 canvas")
+
+    class _El:
+        parent = _Driver()
+
+        @property
+        def screenshot_as_png(self):
+            return shot
+
+    monkeypatch.setattr(browser_login.captcha, "recognize", _recorder(seen))
+    browser_login._solve_captcha(_El())
+    assert seen["bytes"] == shot
+
+
+def test_captcha_falls_back_when_canvas_returns_junk(monkeypatch):
+    """canvas 返回了不可解析的东西时，也要退回元素截图，而不是抛异常。"""
+    shot = b"\x89PNG element-shot"
+    seen = {}
+
+    class _Driver:
+        def execute_script(self, *a, **kw):
+            return "这不是一个 data URL"
+
+    class _El:
+        parent = _Driver()
+
+        @property
+        def screenshot_as_png(self):
+            return shot
+
+    monkeypatch.setattr(browser_login.captcha, "recognize", _recorder(seen))
+    browser_login._solve_captcha(_El())
+    assert seen["bytes"] == shot
 
 
 def test_submit_keeps_stale_retryable_and_does_not_fall_back_to_enter():

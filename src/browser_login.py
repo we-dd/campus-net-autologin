@@ -22,6 +22,7 @@ URL 参数还是动态的），而是用 Selenium 驱动用户机器上装好的
 """
 from __future__ import annotations
 
+import base64
 import html as html_module
 import logging
 import os
@@ -1366,15 +1367,57 @@ def _refresh_captcha(driver, reload_el, image_el) -> None:
         log.debug("刷新页面失败（继续尝试）: %s", e)
 
 
-def _solve_captcha(image_el) -> str:
-    """截验证码图片并识别。
+# 把已经加载在页面里的验证码图片按「原生尺寸」画到 canvas 上取出来。
+# 不能用「重新下载 src」的办法：那个接口每请求一次就生成一张新验证码，
+# 会导致识别的是 A、服务器校验的是 B，永远对不上。canvas 读的是内存里那张，
+# 不发新请求，验证码不会失效。
+_CANVAS_JS = """
+var img = arguments[0];
+if (!img || !img.naturalWidth || !img.naturalHeight) { return null; }
+var c = document.createElement('canvas');
+c.width = img.naturalWidth; c.height = img.naturalHeight;
+var ctx = c.getContext('2d');
+if (!ctx) { return null; }
+ctx.drawImage(img, 0, 0);
+try { return c.toDataURL('image/png'); } catch (e) { return null; }
+"""
 
-    截的是元素本身（screenshot_as_png）而不是整页：整页截图还得自己按坐标裁，
-    页面一滚动或元素被其它东西盖住就裁错，而元素截图是浏览器直接给的，
-    不存在对不齐的问题。
+
+def _grab_captcha_png(image_el) -> bytes:
+    """取验证码图片的字节，尽量按原生分辨率。
+
+    实测同一张图：元素截图拿到 100x35，原生是 160x70 —— 少掉约 3.2 倍像素。
+    在简单验证码上两者结果一样，但分辨率就是准确率，紧张的验证码上差别会显现。
     """
     try:
-        png = image_el.screenshot_as_png
+        data_url = image_el.parent.execute_script(_CANVAS_JS, image_el)
+    except StaleElementReferenceException:
+        raise          # 页面重渲染了，交给上层整轮重来
+    except WebDriverException as e:
+        log.debug("canvas 取图失败，退回元素截图: %s", e)
+        data_url = None
+
+    if data_url:
+        try:
+            raw = base64.b64decode(data_url.split(",", 1)[1])
+            if raw:
+                log.debug("验证码按原生尺寸取出（%d 字节）", len(raw))
+                return raw
+        except (IndexError, ValueError) as e:
+            log.debug("canvas 返回的 data URL 无法解析: %s", e)
+
+    # 兜底：canvas 不可用时（少见）退回元素截图
+    return image_el.screenshot_as_png
+
+
+def _solve_captcha(image_el) -> str:
+    """取验证码图片并识别。
+
+    优先按原生分辨率取图（见 _grab_captcha_png），拿不到才退回元素截图。
+    都不走整页截图：那还得自己按坐标裁，页面一滚动或元素被盖住就裁错。
+    """
+    try:
+        png = _grab_captcha_png(image_el)
     except StaleElementReferenceException:
         # 页面重渲染把图片换掉了。往外抛让上层整轮重来，而不是当成"识别失败"：
         # 识别失败会让 decide_submit 跳过提交，等于白费一轮，而这次本来没提交过。
@@ -1394,7 +1437,7 @@ def _solve_captcha(image_el) -> str:
         log.warning("验证码识别失败: %s", e)
         return ""
 
-    log.info("验证码识别结果: %s（%d 字节的截图）", text, len(png))
+    log.info("验证码识别结果: %s（图片 %d 字节）", text, len(png))
     return text
 
 
