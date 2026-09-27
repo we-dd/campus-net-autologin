@@ -1239,6 +1239,7 @@ Create: `tests/test_secret.py`
 ```python
 import pytest
 
+from src import secret
 from src.secret import SecretError, load_password, save_password
 
 
@@ -1270,6 +1271,49 @@ def test_corrupt_file_raises_readable_error(tmp_path):
     p.write_bytes(b"this is not a dpapi blob")
     with pytest.raises(SecretError, match="解密失败"):
         load_password(str(p))
+
+
+def test_both_calls_forbid_ui(monkeypatch, tmp_path):
+    """钉死 dwFlags 必须是 CRYPTPROTECT_UI_FORBIDDEN（1），两个方向都要。
+
+    传 0 等于允许 DPAPI 做交互式解析：只要 secret.dat 头部 dwFlags 字段
+    （偏移 40）被改坏一个 bit，CryptUnprotectData 就会一直阻塞不返回
+    （实测 25 秒仍未返回，且不占 CPU）；换成 1 之后，同一个文件 2 毫秒内
+    返回错误 1325。本脚本由计划任务每 30 分钟拉起一次，卡住就等于永远登不上网，
+    所以这个参数必须钉死，不能让以后的重构悄悄改回 0。
+    """
+    real = secret.crypt32
+    seen = []
+
+    class SpyCrypt32:
+        """把 dwFlags（第 6 个位置参数，下标 5）记下来，其余原样转发。"""
+
+        def CryptProtectData(self, *args):
+            seen.append(("CryptProtectData", args[5]))
+            return real.CryptProtectData(*args)
+
+        def CryptUnprotectData(self, *args):
+            seen.append(("CryptUnprotectData", args[5]))
+            return real.CryptUnprotectData(*args)
+
+    monkeypatch.setattr(secret, "crypt32", SpyCrypt32())
+
+    p = str(tmp_path / "secret.dat")
+    save_password("hunter2", p)
+    assert load_password(p) == "hunter2"
+
+    assert seen == [("CryptProtectData", 1), ("CryptUnprotectData", 1)]
+
+
+def test_load_directory_raises_secret_error(tmp_path):
+    """路径是目录时 open() 抛 OSError，必须转成 SecretError，调用方只 catch 它。"""
+    with pytest.raises(SecretError, match="读取失败"):
+        load_password(str(tmp_path))
+
+
+def test_save_to_directory_raises_secret_error(tmp_path):
+    with pytest.raises(SecretError, match="写入失败"):
+        save_password("hunter2", str(tmp_path))
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -1326,6 +1370,17 @@ kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
 kernel32.LocalFree.restype = wintypes.HLOCAL
 
 
+# DPAPI 的 dwFlags 参数。绝不能传 0。
+#
+# 0 表示允许 DPAPI 在需要时做交互式解析（弹 UI / 走凭据界面）。本脚本由计划任务
+# 每 30 分钟以非交互方式拉起，一旦 secret.dat 头部 dwFlags 字段（偏移 40，
+# 共 4 字节）被改坏哪怕一个 bit，CryptUnprotectData 就会一直阻塞、永不返回
+# （实测 25 秒仍未返回，且不占 CPU，不是死循环），直到计划任务的执行上限把进程
+# 杀掉 —— 于是每次运行都登不上网。传入 CRYPTPROTECT_UI_FORBIDDEN 后，同样的
+# 文件会在 2 毫秒内返回错误 1325，由调用方按普通解密失败处理。
+_CRYPTPROTECT_UI_FORBIDDEN = 1
+
+
 class SecretError(Exception):
     """密码文件的读写或加解密失败。"""
 
@@ -1340,7 +1395,8 @@ def _protect(data: bytes) -> bytes:
     in_blob, _keep = _make_blob(data)
     out_blob = DATA_BLOB()
     ok = crypt32.CryptProtectData(
-        ctypes.byref(in_blob), "campus-net", None, None, None, 0, ctypes.byref(out_blob)
+        ctypes.byref(in_blob), "campus-net", None, None, None,
+        _CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(out_blob),
     )
     if not ok:
         raise SecretError(f"加密失败，错误码 {ctypes.get_last_error()}")
@@ -1354,12 +1410,19 @@ def _unprotect(data: bytes) -> bytes:
     in_blob, _keep = _make_blob(data)
     out_blob = DATA_BLOB()
     ok = crypt32.CryptUnprotectData(
-        ctypes.byref(in_blob), None, None, None, None, 0, ctypes.byref(out_blob)
+        ctypes.byref(in_blob), None, None, None, None,
+        _CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(out_blob),
     )
     if not ok:
+        # 错误码随损坏方式而变，没有哪个单独指向"账户不对"（本机实测：非 DPAPI 密文
+        # → 87，文件被截断 → 87，密文正文被改坏 → 13；别处也见过 -2146893813）。
+        # 所以先说最可能的原因和对策，"换过账户"只作为另一种可能提一句 ——
+        # 否则用户会去找一个并不存在的账户问题。
         raise SecretError(
             f"解密失败，错误码 {ctypes.get_last_error()}。"
-            "密码文件必须在加密它的同一个 Windows 账户下解密。"
+            "密码文件读不出来，多半是文件已损坏或不是本程序生成的，"
+            "请重新运行 python login.py --setup 生成一个；"
+            "若这个文件是从别的 Windows 账户或别的机器上拷来的，同样解不开，需要在本机重新生成。"
         )
     try:
         return ctypes.string_at(out_blob.pbData, out_blob.cbData)
@@ -1369,17 +1432,26 @@ def _unprotect(data: bytes) -> bytes:
 
 def save_password(password: str, path: str) -> None:
     blob = _protect(password.encode("utf-8"))
-    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(blob)
+    # 目录或文件不可写时 open() 抛的是 OSError（如把目录当文件写、没权限），
+    # 调用方只 catch SecretError，所以这里统一转成 SecretError。
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(blob)
+    except OSError as e:
+        raise SecretError(f"密码写入失败: {path}（{e}）") from e
     log.info("密码已加密保存到 %s", path)
 
 
 def load_password(path: str) -> str:
     if not os.path.exists(path):
         raise SecretError(f"找不到密码文件: {path}。请先运行 python login.py --setup")
-    with open(path, "rb") as f:
-        blob = f.read()
+    try:
+        with open(path, "rb") as f:
+            blob = f.read()
+    except OSError as e:
+        # 路径是目录、或被占用 / 没权限时，open() 抛 OSError 而不是 SecretError
+        raise SecretError(f"密码文件读取失败: {path}（{e}）") from e
     if not blob:
         raise SecretError(f"密码文件是空的: {path}。请重新运行 python login.py --setup")
     return _unprotect(blob).decode("utf-8")
@@ -1391,7 +1463,7 @@ def load_password(path: str) -> str:
 python -m pytest tests/test_secret.py -v
 ```
 
-Expected: 5 passed
+Expected: 8 passed
 
 - [ ] **Step 5: Commit**
 
