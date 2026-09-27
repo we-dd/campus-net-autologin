@@ -10,17 +10,27 @@ import time
 from types import SimpleNamespace
 
 import pytest
-from selenium.common.exceptions import NoSuchElementException, WebDriverException
+from selenium.common.exceptions import (
+    InvalidSelectorException,
+    NoSuchElementException,
+    WebDriverException,
+)
 
 from src import browser_login
 from src.browser_login import (
     REASONS,
+    _captcha_rank,
     _describe,
+    _find_by_selector,
+    _refresh_captcha,
+    _tick_agree,
     decide_submit,
     judge,
     locate,
+    pick_agree,
     pick_captcha_image,
     pick_captcha_input,
+    pick_captcha_reload,
     pick_password,
     pick_submit,
     pick_username,
@@ -36,8 +46,8 @@ def _desc(tag, index, **kw):
     """造一个描述符。字段名和 _describe() 的输出保持一致。"""
     d = {
         "index": index, "tag": tag, "type": "", "id": "", "name": "", "class": "",
-        "placeholder": "", "value": "", "src": "", "text": "", "visible": True,
-        "size": (0, 0),
+        "placeholder": "", "value": "", "src": "", "text": "", "nearby": "",
+        "visible": True, "size": (0, 0),
     }
     if "class_" in kw:  # class 是 Python 关键字，测试里用 class_ 传
         kw["class"] = kw.pop("class_")
@@ -70,6 +80,60 @@ def _split(descriptors):
     controls = [d for d in descriptors if d["tag"] != "img"]
     images = [d for d in descriptors if d["tag"] == "img"]
     return controls, images
+
+
+# --- 驱动层的测试替身（不起浏览器）------------------------------------------
+
+
+class _StubElement:
+    """给驱动层那几个函数用的元素替身。
+
+    只实现被真正调用的几个接口：find_element（找可点击祖先）、is_selected、
+    is_displayed。用身份比较来断言"点的是哪一个"，所以不需要更多行为。
+    """
+
+    def __init__(self, name, ancestor=None, selected=False, displayed=True):
+        self.name = name
+        self._ancestor = ancestor
+        self._selected = selected
+        self._displayed = displayed
+
+    def find_element(self, by, value):
+        if self._ancestor is None:
+            raise NoSuchElementException(value)
+        return self._ancestor
+
+    def is_selected(self):
+        return self._selected
+
+    def is_displayed(self):
+        return self._displayed
+
+    def __repr__(self):
+        return f"<{self.name}>"
+
+
+class _StubDriver:
+    """假 driver：记录 JS 点击了哪个元素、整页刷新了几次，并按配置回答 find_elements。"""
+
+    def __init__(self, found=None, js_ok=True):
+        self.js_clicks = []
+        self.refreshes = 0
+        self._found = [] if found is None else found
+        self._js_ok = js_ok
+
+    def find_elements(self, by, value):
+        if isinstance(self._found, Exception):
+            raise self._found
+        return list(self._found)
+
+    def execute_script(self, script, el):
+        if not self._js_ok:
+            raise WebDriverException("blocked")
+        self.js_clicks.append(el)
+
+    def refresh(self):
+        self.refreshes += 1
 
 
 # --- 真实门户页面的形状 ------------------------------------------------------
@@ -466,16 +530,13 @@ def test_describe_tolerates_missing_attributes():
 def test_render_overrides_says_hit_or_miss():
     """用户配完选择器后，唯一的确认办法就是再跑一次 --dump-form，
     所以命中/没找到/留空三种情况都必须说清楚。"""
+    driver = _StubDriver(found=[_StubElement("hit")])
 
-    class _Driver:
-        def find_element(self, by, value):
-            if value == "#user":
-                return object()
-            raise NoSuchElementException(f"no such element: {value}")
-
-    text = render_overrides(_Driver(), {"username": "#user", "password": "#nope", "submit": ""})
-
+    text = render_overrides(driver, {"username": "#user"})
     assert "#user → 命中" in text
+
+    text = render_overrides(_StubDriver(found=[]),
+                            {"username": "#user", "password": "#nope", "submit": ""})
     assert "#nope → 没找到" in text
     assert "退回自动识别" in text
     assert "留空" in text
@@ -626,3 +687,357 @@ def test_describe_output_feeds_locate():
     assert page.captcha_image["index"] == 2
     assert page.captcha_input["index"] == 3
     assert page.submit["index"] == 4
+
+
+# ===========================================================================
+# 真实门户页面（四川工业科技学院 SAM SSO，Angular SPA）
+#
+# 下面这个 fixture 的属性值全部来自对真实页面的实测，不是编的：
+#   - input 共 9 个，其中 2 个可见（账号、验证码），6 个 hidden（含一个和验证码框
+#     同名的隐藏字段，就是它让 find_element("input[name=captcha_code]") 打偏）
+#   - 图片 2 个：14x14 的"显示密码"眼睛图标、80x28 的真验证码 img.code-img
+#   - 唯一的复选框是隐藏的（ant-design 把真实 input 藏了）
+#   - "换一个"是 a.code-reload-content，并且它包住了验证码图片
+# 只有各标签之间的交错顺序是按 Angular 表单的常理摆的（<a> 包住 <img>，故 <a> 在前）。
+# ===========================================================================
+
+
+def real_portal_page():
+    return [
+        _desc("input", 0, type="text", id="nameInput", name="username",
+              class_="ant-input ng-untouched ng-pristine ng-valid ng-star-inserted",
+              placeholder="请输入账号", size=(322, 34)),
+        _desc("input", 1, type="password",
+              class_="ant-input ng-untouched ng-pristine ng-valid ng-star-inserted",
+              placeholder="请输入密码", size=(322, 34)),
+        # 密码框的"显示密码"眼睛图标：只有 14x14，也过得了尺寸门槛，
+        # 而且离密码框比真验证码近得多
+        _desc("img", 2, class_="icon-password-hide ng-star-inserted",
+              src="http://10.71.29.181/sam-sso-public/cas-login-new/assets/login/pwd-hide.svg",
+              size=(14, 14)),
+        _desc("input", 3, type="hidden", name="type", value="UsernamePassword",
+              size=(0, 0), visible=False),
+        _desc("input", 4, type="hidden", name="_eventId", value="submit",
+              size=(0, 0), visible=False),
+        _desc("input", 5, type="hidden", name="geolocation", size=(0, 0), visible=False),
+        _desc("input", 6, type="hidden", name="execution",
+              value="40cc1087-f4ae-44ce-9", size=(0, 0), visible=False),
+        # 和验证码框同名、但是隐藏的那个（实测 find_element 会先返回它）
+        _desc("input", 7, type="hidden", name="captcha_code", size=(0, 0), visible=False),
+        _desc("input", 8, type="text", name="captcha_code",
+              class_="ant-input ng-untouched ng-pristine ng-valid ng-star-inserted",
+              placeholder="校验码", size=(237, 34)),
+        _desc("a", 9, class_="code-reload-content ng-star-inserted", text="换一个",
+              size=(40, 20)),
+        _desc("img", 10, class_="code-img",
+              src="http://10.71.29.181/sam-sso/api/captcha/generate/DEFAULT",
+              size=(80, 28)),
+        _desc("input", 11, type="checkbox",
+              class_="ant-checkbox-input ng-untouched ng-pristine ng-valid",
+              value="on", size=(16, 16), visible=False,
+              nearby="请先阅读并同意《用户协议》《免责声明协议》《用户隐私政策》"),
+        _desc("button", 12, type="button", class_="ant-tabs-nav-more ant-dropdown-trigger",
+              visible=False, size=(46, 32)),
+        _desc("button", 13, type="submit", id="submitBtn",
+              class_="igniter--in-password theme-button--primary ant-btn disabled",
+              text="立即登录", size=(370, 40)),
+    ]
+
+
+def test_real_portal_page_is_fully_located():
+    """实测页面上的七个字段全部要能自动认出来（不依赖任何 selectors 覆盖）。"""
+    controls, images = _split(real_portal_page())
+    page = locate(controls, images)
+
+    assert page.reason == ""
+    assert page.username["id"] == "nameInput"
+    assert page.password["index"] == 1
+    assert page.captcha_image["index"] == 10            # img.code-img
+    assert page.captcha_input["index"] == 8             # 可见的那个同名字段
+    assert page.captcha_reload["index"] == 9            # a.code-reload-content
+    assert page.agree["index"] == 11                    # 那个隐藏的复选框
+    assert page.submit["index"] == 13                   # #submitBtn
+
+
+def test_real_portal_captcha_image_beats_the_closer_password_eye_icon():
+    """眼睛图标 14x14 也过尺寸门槛，而且比真验证码离密码框近得多。
+
+    只按距离挑就会把眼睛图标截下来当验证码送去识别——这是一条真实的误判路径，
+    所以这里把"档位压过距离"钉死。
+    """
+    controls, images = _split(real_portal_page())
+    pwd = pick_password(controls)
+    eye, captcha = images[0], images[1]
+
+    assert _captcha_rank(eye) == 2                       # 一个关键字都不沾
+    assert _captcha_rank(captcha) == 0                   # src 里含 captcha，强档
+    assert abs(eye["index"] - pwd["index"]) < abs(captcha["index"] - pwd["index"])
+    assert pick_captcha_image(images, pwd)["index"] == captcha["index"]
+
+
+def test_real_portal_visible_captcha_input_wins_over_the_hidden_namesake():
+    """name=captcha_code 有两个元素，隐藏的那个在前面。
+
+    注意 _split 会把图片摘出去、位置会变，所以断言一律按描述符自己的 index 找，
+    不按下标找。
+    """
+    controls, images = _split(real_portal_page())
+    namesakes = [d for d in controls if d["name"] == "captcha_code"]
+    hidden = next(d for d in namesakes if not d["visible"])
+    visible = next(d for d in namesakes if d["visible"])
+
+    image = pick_captcha_image(images, pick_password(controls))
+    taken = {pick_username(controls)["index"], pick_password(controls)["index"]}
+    chosen = pick_captcha_input(controls, image, taken)
+
+    assert (hidden["index"], visible["index"]) == (7, 8)   # 隐藏的确实在前面
+    assert chosen is visible
+
+
+def test_real_portal_agree_box_is_found_even_though_it_is_hidden():
+    """ant-design 把真实 input 藏起来了：按可见性过滤就永远找不到它。"""
+    controls, _ = _split(real_portal_page())
+    agree = pick_agree(controls)
+
+    assert agree["index"] == 11
+    assert agree["visible"] is False
+    assert "同意" in agree["nearby"]
+
+
+def test_real_portal_submit_is_the_visible_submit_button_not_the_hidden_tab_button():
+    controls, _ = _split(real_portal_page())
+    assert pick_submit(controls)["id"] == "submitBtn"
+
+
+def test_real_portal_reload_control_is_the_wrapping_link():
+    """实测点图片会被包着它的 <a> 拦掉，所以必须优先用它。"""
+    controls, images = _split(real_portal_page())
+    image = pick_captcha_image(images, pick_password(controls))
+    reload_el = pick_captcha_reload(controls, image)
+
+    assert reload_el["index"] == 9
+    assert reload_el["class"].startswith("code-reload-content")
+    assert "换一个" in reload_el["text"]
+
+
+# --- 修复 1：选择器匹配到多个元素时要挑可见的那个 ---------------------------
+
+
+def test_selector_prefers_the_first_visible_match():
+    """实测：input[name=captcha_code] 在真实页面上匹配两个元素，第一个是隐藏的，
+    而 find_element 返回的正是那个隐藏的——于是打字打进了虚空，验证码框始终是空的。"""
+    hidden = _StubElement("hidden", displayed=False)
+    visible = _StubElement("visible", displayed=True)
+    driver = _StubDriver(found=[hidden, visible])
+
+    chosen = _find_by_selector(driver, "input[name=captcha_code]", "captcha_input")
+
+    assert chosen is visible
+
+
+def test_selector_falls_back_to_the_first_match_when_none_are_visible():
+    first = _StubElement("first", displayed=False)
+    second = _StubElement("second", displayed=False)
+    driver = _StubDriver(found=[first, second])
+
+    assert _find_by_selector(driver, "input[name=x]", "captcha_input") is first
+
+
+def test_selector_logs_how_many_matched_and_which_one_won(caplog):
+    hidden = _StubElement("hidden", displayed=False)
+    visible = _StubElement("visible", displayed=True)
+    driver = _StubDriver(found=[hidden, visible])
+
+    with caplog.at_level(logging.INFO, logger="src.browser_login"):
+        _find_by_selector(driver, "input[name=captcha_code]", "captcha_input")
+
+    assert "匹配到 2 个元素" in caplog.text
+    assert "第 2 个" in caplog.text
+
+
+def test_selector_with_a_single_match_is_returned_as_is():
+    only = _StubElement("only")
+    assert _find_by_selector(_StubDriver(found=[only]), "#submitBtn", "submit") is only
+
+
+def test_selector_that_matches_nothing_warns_and_returns_none(caplog):
+    with caplog.at_level(logging.WARNING, logger="src.browser_login"):
+        got = _find_by_selector(_StubDriver(found=[]), "#nope", "submit")
+
+    assert got is None
+    assert "#nope" in caplog.text
+
+
+def test_invalid_selector_warns_instead_of_raising(caplog):
+    """用户把选择器写坏了（比如漏了半个引号）也只警告，不能把整轮登录弄崩。"""
+    driver = _StubDriver(found=InvalidSelectorException("bad selector"))
+
+    with caplog.at_level(logging.WARNING, logger="src.browser_login"):
+        assert _find_by_selector(driver, "input[", "submit") is None
+
+    assert "不是合法的选择器" in caplog.text
+
+
+# --- 修复 2：不能依赖 CSS 的 [type=...] -------------------------------------
+
+
+def test_username_is_found_when_the_descriptor_has_no_type_key():
+    """实测：本页用户名框没有字面的 type 属性，CSS 的 input[type=text] 匹配不上
+    （验证码框也一样）。描述符里 type 缺失时必须按"没有 type"（即 text）处理，
+    而不是抛 KeyError。"""
+    account = _desc("input", 0, id="nameInput", name="username",
+                    placeholder="请输入账号", size=(322, 34))
+    del account["type"]                                  # 完全没有 type 这个键
+    controls, images = _split([
+        account,
+        _desc("input", 1, type="password", size=(322, 34)),
+        _desc("button", 2, type="submit", text="立即登录"),
+    ])
+
+    assert "type" not in controls[0]
+    assert locate(controls, images).username["id"] == "nameInput"
+
+
+def test_type_selector_that_misses_explains_the_literal_attribute_trap(caplog):
+    """用户写 [type=text] 又没匹配到时，提示里必须点出"字面的 type 属性"这个坑，
+    否则他会以为是门户改版了。"""
+    with caplog.at_level(logging.WARNING, logger="src.browser_login"):
+        _find_by_selector(_StubDriver(found=[]), "input[type=text]", "username")
+
+    assert "字面的 type 属性" in caplog.text
+
+
+# --- 修复 3：同意协议勾选框 -------------------------------------------------
+
+
+def test_agree_is_not_clicked_again_when_already_ticked():
+    box = _StubElement("box", selected=True)
+    driver = _StubDriver()
+
+    _tick_agree(driver, box)
+
+    assert driver.js_clicks == []
+
+
+def test_agree_is_clicked_with_js_when_unticked():
+    """实测：ant-design 的真实 input 是隐藏的，普通 click 点不到；
+    JS 点击能让 is_selected() 由 False 变 True。"""
+    box = _StubElement("box", selected=False)
+    driver = _StubDriver()
+
+    _tick_agree(driver, box)
+
+    assert driver.js_clicks == [box]
+
+
+def test_agree_missing_is_a_no_op_not_a_failure():
+    driver = _StubDriver()
+
+    _tick_agree(driver, None)
+
+    assert driver.js_clicks == []
+
+
+def test_agree_click_failure_only_warns(caplog):
+    """勾不上只警告、继续提交，不能让整轮登录崩掉。"""
+    box = _StubElement("box", selected=False)
+    driver = _StubDriver(js_ok=False)
+
+    with caplog.at_level(logging.WARNING, logger="src.browser_login"):
+        _tick_agree(driver, box)
+
+    assert "勾选用户协议失败" in caplog.text
+
+
+def test_unmatched_agree_override_warns_and_falls_back_to_the_heuristic(caplog):
+    """配的 agree 选择器匹配不到时：警告 + 退回自动识别，而不是失败。"""
+    fallback = _StubElement("heuristic-box")
+    driver = _StubDriver(found=[])
+
+    with caplog.at_level(logging.WARNING, logger="src.browser_login"):
+        got = browser_login._resolve(driver, [fallback], "input[type=checkbox]",
+                                     {"index": 0}, "agree")
+
+    assert got is fallback
+    assert "agree" in caplog.text
+
+
+def test_agree_override_is_used_when_it_matches():
+    chosen = _StubElement("configured-box")
+    heuristic = _StubElement("heuristic-box")
+    driver = _StubDriver(found=[chosen])
+
+    got = browser_login._resolve(driver, [heuristic], "#myBox", {"index": 0}, "agree")
+
+    assert got is chosen
+
+
+# --- 修复 4：验证码刷新要走 a.code-reload-content ----------------------------
+
+
+def test_reload_control_is_preferred_over_the_captcha_image(monkeypatch):
+    """实测点图片会被 ElementClickInterceptedException 拦掉，真正接收点击的是 <a>。"""
+    monkeypatch.setattr(browser_login, "_REFRESH_WAIT", 0)
+    image = _StubElement("image")
+    reload_el = _StubElement("reload")
+    driver = _StubDriver()
+
+    _refresh_captcha(driver, reload_el, image)
+
+    assert driver.js_clicks == [reload_el]
+    assert driver.refreshes == 0
+
+
+def test_refresh_falls_back_to_the_image_when_there_is_no_reload_control(monkeypatch):
+    monkeypatch.setattr(browser_login, "_REFRESH_WAIT", 0)
+    image = _StubElement("image")
+    driver = _StubDriver()
+
+    _refresh_captcha(driver, None, image)
+
+    assert driver.js_clicks == [image]
+
+
+def test_refresh_uses_the_images_clickable_ancestor(monkeypatch):
+    """真实页面上 <a class="code-reload-content"> 正是 <img class="code-img"> 的祖先，
+    所以"兜底点祖先"和"点刷新控件"其实是同一个元素。"""
+    monkeypatch.setattr(browser_login, "_REFRESH_WAIT", 0)
+    ancestor = _StubElement("a.code-reload-content")
+    image = _StubElement("image", ancestor=ancestor)
+    driver = _StubDriver()
+
+    _refresh_captcha(driver, None, image)
+
+    assert driver.js_clicks == [ancestor]
+
+
+def test_refresh_falls_back_to_reloading_the_whole_page(monkeypatch):
+    """什么都点不动时最后才整页刷新（它会把已填内容清掉，所以放最后）。"""
+    monkeypatch.setattr(browser_login, "_REFRESH_WAIT", 0)
+    image = _StubElement("image")
+    driver = _StubDriver(js_ok=False)
+
+    _refresh_captcha(driver, None, image)
+
+    assert driver.js_clicks == []
+    assert driver.refreshes == 1
+
+
+def test_reload_control_absent_when_there_is_no_captcha_image():
+    controls, _ = _split(real_portal_page())
+    assert pick_captcha_reload(controls, None) is None
+
+
+def test_report_paths_survive_a_missing_type_key():
+    """诊断路径同样会读 type：判定"不是登录页"时的说明、--dump-form 的元素清单。
+
+    这两条路径本来就是出错时才走的，在这里再抛一个 KeyError 会把真正的错因盖掉，
+    用户看到的是崩溃而不是"没找到密码框（可运行 --dump-form 看清单）"。
+    """
+    controls, images = _split([_desc("input", 0, id="search", placeholder="搜索")])
+    del controls[0]["type"]                              # 缺 type 键
+    page = locate(controls, images)
+
+    assert page.reason == "not_login_page"
+    assert "密码输入框" in page.detail
+    assert "type" in render_elements(controls)

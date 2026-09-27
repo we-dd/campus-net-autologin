@@ -3,7 +3,14 @@ import logging
 
 import pytest
 
-from src.config import DEFAULT_PROBE_URLS, Config, ConfigError, _KNOWN_KEYS, load
+from src.config import (
+    DEFAULT_PROBE_URLS,
+    SELECTOR_KEYS,
+    Config,
+    ConfigError,
+    _KNOWN_KEYS,
+    load,
+)
 
 
 def write(tmp_path, obj):
@@ -368,3 +375,65 @@ def test_selectors_object_is_not_shared_between_instances(tmp_path):
     a = load(write(tmp_path, minimal()))
     a.selectors["username"] = "#hacked"
     assert load(write(tmp_path, minimal())).selectors == {}
+
+
+# --- 以下为真实门户校准新增：selectors 的键 --------------------------------
+
+# 实测页面（四川工业科技学院 SAM SSO）验证过的一套选择器
+REAL_PORTAL_SELECTORS = {
+    "username": "#nameInput",
+    "password": "input[type=password]",
+    "captcha_input": "input[name=captcha_code]:not([type=hidden])",
+    "captcha_image": "img.code-img",
+    "captcha_reload": "a.code-reload-content",
+    "agree": "input[type=checkbox]",
+    "submit": "#submitBtn",
+}
+
+
+def test_all_real_portal_selectors_are_accepted(tmp_path):
+    """这套值是拿真实页面校准过的，必须原样加载进来，一个键都不能被吞掉。"""
+    assert load(write(tmp_path, minimal(selectors=REAL_PORTAL_SELECTORS))).selectors == \
+        REAL_PORTAL_SELECTORS
+
+
+def test_selector_keys_are_exactly_the_documented_options():
+    """钉住名单。
+
+    browser_login 只会读这几个键，config 只会校验这几个键——加新键（比如当初
+    漏掉的 agree / captcha_reload）时必须两边一起改，这条会提醒。
+    """
+    assert SELECTOR_KEYS == (
+        "username", "password", "captcha_input", "captcha_image",
+        "captcha_reload", "agree", "submit",
+    )
+
+
+def test_unknown_selector_key_warns_with_a_suggestion(tmp_path, caplog):
+    """写错键名（captca_input）不会报错，只会静默按自动识别跑，用户就一直
+    "怎么又不灵了"——所以必须警告一次，并给出最接近的正确键名。"""
+    with caplog.at_level(logging.WARNING, logger="src.config"):
+        cfg = load(write(tmp_path, minimal(selectors={"captca_input": "#x"})))
+
+    # 键保留下来（不报错、不吞掉），只是提醒它没人认
+    assert cfg.selectors == {"captca_input": "#x"}
+    assert "无法识别的键" in caplog.text
+    assert "captcha_input" in caplog.text
+
+
+def test_unknown_selector_key_without_a_near_match_still_warns(tmp_path, caplog):
+    with caplog.at_level(logging.WARNING, logger="src.config"):
+        load(write(tmp_path, minimal(selectors={"zzzzzz": "#x"})))
+    assert "无法识别的键" in caplog.text
+
+
+def test_known_selector_keys_do_not_warn(tmp_path, caplog):
+    with caplog.at_level(logging.WARNING, logger="src.config"):
+        load(write(tmp_path, minimal(selectors=REAL_PORTAL_SELECTORS)))
+    assert caplog.text == ""
+
+
+def test_selector_values_must_still_be_strings(tmp_path):
+    """新键也要走同一条类型校验：写成对象是很自然的误写。"""
+    with pytest.raises(ConfigError, match="selectors"):
+        load(write(tmp_path, minimal(selectors={"agree": {"selector": "#x"}})))

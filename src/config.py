@@ -41,6 +41,20 @@ _OPTIONAL_URL_FIELDS = ("login_page_url", "login_submit_url", "captcha_url")
 # 两者的启动参数和驱动由 selenium 分别处理。
 _BROWSERS = ("edge", "chrome")
 
+# selectors 里认得的键，值都是 CSS 选择器。
+# 写错一个键名（比如把 captcha_input 拼成 captca_input）不会报错，只会静默地按
+# 自动识别跑，然后用户就一直"怎么又不灵了"——所以拼错的要警告一次，
+# 和顶层键的处理保持一致（见 _warn_unknown_keys）。
+SELECTOR_KEYS = (
+    "username",        # 账号输入框
+    "password",        # 密码输入框
+    "captcha_input",   # 验证码输入框
+    "captcha_image",   # 验证码图片
+    "captcha_reload",  # "换一张"控件（点图片会被它拦掉，所以要单独指定）
+    "agree",           # "同意用户协议"的勾选框
+    "submit",          # 提交按钮
+)
+
 # 日志级别只认这五个。故意不用 logging.getLevelNamesMapping()：那张表里有 NOTSET
 # （值是 0），填了它 root logger 的级别就变成 0，DEBUG 及以下会全部涌进 1 MiB 的
 # 轮转日志；FATAL / WARN 这类别名也不放进来，用户没有理由手写它们。
@@ -224,6 +238,16 @@ def _validate_selectors(selectors: Any, where: str) -> dict[str, str]:
         if not isinstance(value, str):
             raise _bad_type(label, str(key), "字符串", value)
         cleaned[str(key)] = value.strip()
+
+    for key in cleaned:
+        if key not in SELECTOR_KEYS:
+            hint = difflib.get_close_matches(key, list(SELECTOR_KEYS), n=1)
+            tail = f"，是不是想写 {hint[0]} ？" if hint else ""
+            log.warning(
+                "%s 里有无法识别的键 %s%s（已忽略；可用的键是 %s）",
+                label, key, tail, " / ".join(SELECTOR_KEYS),
+            )
+
     return cleaned
 
 

@@ -103,12 +103,20 @@ _CAPTCHA_MAX_W = 200
 _CAPTCHA_MAX_H = 100
 
 # 验证码图片的命名特征。大小写不敏感，同时看 src / id / name / class / placeholder。
-# 裸的 "code" 是故意留的：锐捷和一些国产门户的图片就叫 code，
-# 但它排在最后面，只有在没有更明确的字样时才起作用（见 pick_captcha_image 的打分）。
-_CAPTCHA_WORDS = (
-    "captcha", "validcode", "checkcode", "authcode", "vcode", "yzm",
-    "verify", "code", "验证码", "验证",
-)
+# 分强/弱两档是必需的，不是洁癖：实测真实门户页面上同时有一个 14x14 的
+# "显示/隐藏密码"眼睛图标和一个 80x28 的真验证码，两者都小到能过尺寸门槛，
+# 而眼睛图标离密码框更近。只按距离或只按"有没有关键字"都可能挑错，分档之后
+# 真验证码（src 含 captcha）落在强档，眼睛图标（class="icon-password-hide"）
+# 一个词都不沾，强档直接胜出，完全不依赖距离。
+_CAPTCHA_WORDS_STRONG = ("captcha", "validcode", "checkcode", "authcode", "yzm", "验证码")
+# 弱档：锐捷等国产门户的图片就叫 code，弱档只在没有强档可选时才起作用。
+_CAPTCHA_WORDS_WEAK = ("code", "verify", "vcode", "验证")
+
+# "同意用户协议"勾选框附近的文字特征。
+_AGREE_WORDS = ("同意", "协议", "agree", "accept", "terms")
+
+# "换一张验证码"控件的文字特征，大小写不敏感。
+_RELOAD_WORDS = ("换一个", "换一张", "刷新", "看不清", "reload", "refresh", "change")
 
 # 提交按钮的文字特征，大小写不敏感。
 _SUBMIT_TEXTS = ("登录", "登入", "连接", "login", "log in", "sign in", "signin")
@@ -133,12 +141,23 @@ _CAPTCHA_ERRORS = (
 )
 
 
+def _type_of(desc: dict) -> str:
+    """描述符的 type，取不到按"没有 type"处理。
+
+    用 .get 而不是下标是有实测原因的：有的前端框架不给 input 写字面的 type 属性，
+    这种描述符里可能压根没有 type 这个键，缺了要按"没有 type"（浏览器按 text 处理）
+    来算，而不是抛 KeyError——真实门户页面的用户名框就是这种情况。
+    纯函数层一律用这个取值，别处不要直接下标 desc["type"]。
+    """
+    return desc.get("type", "")
+
+
 def _is_textish(desc: dict) -> bool:
     """是不是"可以当文本框用"的可见 input。"""
     return (
         desc["tag"] == "input"
         and desc["visible"]
-        and desc["type"] in _TEXTISH_TYPES
+        and _type_of(desc) in _TEXTISH_TYPES
     )
 
 
@@ -157,17 +176,21 @@ def pick_password(controls: list[dict]) -> dict | None:
     所以这个函数的结果是"我们在不在登录页"的主要判据。
     """
     for desc in controls:
-        if desc["tag"] == "input" and desc["visible"] and desc["type"] == "password":
+        if desc["tag"] == "input" and desc["visible"] and _type_of(desc) == "password":
             return desc
     return None
 
 
-def _captcha_hint(desc: dict) -> bool:
-    """图片的 src/id/name/class/placeholder 里有没有验证码字样。"""
+def _captcha_rank(desc: dict) -> int:
+    """命名像不像验证码：0 很像，1 有点像，2 看不出来。"""
     haystack = " ".join(
         (desc["src"], desc["id"], desc["name"], desc["class"], desc["placeholder"])
     ).lower()
-    return any(word in haystack for word in _CAPTCHA_WORDS)
+    if any(word in haystack for word in _CAPTCHA_WORDS_STRONG):
+        return 0
+    if any(word in haystack for word in _CAPTCHA_WORDS_WEAK):
+        return 1
+    return 2
 
 
 def _is_captcha_sized(desc: dict) -> bool:
@@ -186,8 +209,10 @@ def pick_captcha_image(images: list[dict], anchor: dict | None) -> dict | None:
     规则分两步，先卡尺寸再看名字：
       1. 尺寸必须像验证码（小图）。这一步是硬门槛：页面上的大图基本都是 logo，
          把 logo 当验证码抓去识别，识别结果必然是垃圾，然后就是一串白费的登录尝试。
-      2. 合格的小图里，优先选名字里带 captcha/验证码 的；名字看不出来时，
-         选离 anchor（密码框）最近的——验证码图通常就贴在密码框旁边。
+         （注意小图里也会有干扰项，比如密码框的"显示密码"眼睛图标，所以还要看第 2 步。）
+      2. 合格的小图里按命名分档：强档（captcha/validcode/…）优先，其次弱档
+         （code/verify/…），最后才是完全看不出名字的，档内再取离 anchor（密码框）
+         最近的。实测的真验证码 src 含 captcha，会稳稳落在强档。
     """
     candidates = [d for d in images if d["visible"] and _is_captcha_sized(d)]
     if not candidates:
@@ -198,10 +223,54 @@ def pick_captcha_image(images: list[dict], anchor: dict | None) -> dict | None:
 
     def key(desc: dict) -> tuple:
         distance = abs(desc["index"] - anchor_index) if anchor_index is not None else 0
-        # 名字命中排第一优先级，其次距离近的，最后文档顺序靠前的（结果才稳定）
-        return (0 if _captcha_hint(desc) else 1, distance, desc["index"])
+        # 名字像不像排第一优先级，其次距离近的，最后文档顺序靠前的（结果才稳定）
+        return (_captcha_rank(desc), distance, desc["index"])
 
     return min(candidates, key=key)
+
+
+def pick_agree(controls: list[dict]) -> dict | None:
+    """挑出"同意用户协议"的勾选框。
+
+    刻意**不**按可见性过滤：实测页面上 ant-design 把真实 input 藏了起来
+    （is_displayed() 为 False），可见的只是它外面的样式块，按可见性筛等于永远
+    找不到。优先取附近文字提到 同意/协议 的那个，取不到就退回第一个复选框。
+
+    找不到就返回 None，调用方跳过勾选、继续提交（这个页面实测按钮一直是可用的，
+    勾选框不是硬门槛）。
+    """
+    boxes = [d for d in controls if d["tag"] == "input" and _type_of(d) == "checkbox"]
+    if not boxes:
+        return None
+
+    def key(desc: dict) -> tuple:
+        nearby = desc.get("nearby", "").lower()
+        return (0 if any(word in nearby for word in _AGREE_WORDS) else 1, desc["index"])
+
+    return min(boxes, key=key)
+
+
+def pick_captcha_reload(controls: list[dict], image: dict | None) -> dict | None:
+    """挑出"换一张验证码"的控件。
+
+    实测：直接点验证码图片会被拦下来（ElementClickInterceptedException）——真正
+    接收点击的是包着它的 <a class="code-reload-content">（文字"换一个"）。所以先把
+    这个控件找出来；找不到就返回 None，调用方会依次退回图片的可点击祖先、图片本身。
+
+    只认可见的 <a>/<button>，多个候选时取离验证码图片最近的。
+    """
+    if image is None or image["index"] < 0:
+        return None
+
+    candidates = [
+        d for d in controls
+        if d["tag"] in ("a", "button") and d["visible"]
+        and any(word in _label(d) for word in _RELOAD_WORDS)
+    ]
+    if not candidates:
+        return None
+
+    return min(candidates, key=lambda d: (abs(d["index"] - image["index"]), d["index"]))
 
 
 def pick_captcha_input(controls: list[dict], image: dict | None, taken: set[int]) -> dict | None:
@@ -246,8 +315,8 @@ def pick_submit(controls: list[dict]) -> dict | None:
 
     explicit = [
         d for d in visible
-        if (d["tag"] == "input" and d["type"] == "submit")
-        or (d["tag"] == "button" and d["type"] in ("", "submit"))
+        if (d["tag"] == "input" and _type_of(d) == "submit")
+        or (d["tag"] == "button" and _type_of(d) in ("", "submit"))
     ]
     if explicit:
         return min(explicit, key=lambda d: d["index"])
@@ -271,7 +340,7 @@ def _brief(controls: list[dict], images: list[dict]) -> str:
         return sum(1 for d in everything if d["tag"] == tag)
 
     visible_inputs = [d for d in controls if d["tag"] == "input" and d["visible"]]
-    types = "、".join(sorted({(d["type"] or "无 type") for d in visible_inputs})) or "无"
+    types = "、".join(sorted({(_type_of(d) or "无 type") for d in visible_inputs})) or "无"
     return (
         f"页面上共 {len(everything)} 个表单元素"
         f"（input {count('input')} / button {count('button')} / "
@@ -307,6 +376,8 @@ class Page:
     captcha_image: dict | None = None
     captcha_input: dict | None = None
     submit: dict | None = None
+    agree: dict | None = None
+    captcha_reload: dict | None = None
     reason: str = ""
     detail: str = ""
 
@@ -342,7 +413,11 @@ def locate(controls: list[dict], images: list[dict]) -> Page:
             ),
         )
 
-    return Page(user, pwd, image, cap, pick_submit(controls))
+    return Page(
+        user, pwd, image, cap, pick_submit(controls),
+        agree=pick_agree(controls),
+        captcha_reload=pick_captcha_reload(controls, image),
+    )
 
 
 def decide_submit(needs_captcha: bool, captcha_text: str) -> tuple[bool, str]:
@@ -404,7 +479,7 @@ def render_elements(descriptors: list[dict]) -> str:
     for d in descriptors:
         width, height = d["size"]
         lines.append(
-            f'[{d["index"]:>3}] <{d["tag"]}> type={d["type"] or "-"} '
+            f'[{d["index"]:>3}] <{d["tag"]}> type={_type_of(d) or "-"} '
             f'id={d["id"] or "-"} name={d["name"] or "-"} class={d["class"] or "-"} '
             f'placeholder={d["placeholder"] or "-"} '
             f'可见={"是" if d["visible"] else "否"} 尺寸={width}x{height} '
@@ -432,6 +507,8 @@ def render_verdict(controls: list[dict], images: list[dict]) -> str:
         f"密码框     : {_suggest(page.password)}",
         f"验证码图片 : {_suggest(page.captcha_image)}",
         f"验证码输入 : {_suggest(page.captcha_input)}",
+        f"验证码刷新 : {_suggest(page.captcha_reload)}",
+        f"同意勾选框 : {_suggest(page.agree)}",
         f"提交按钮   : {_suggest(page.submit)}",
     ]
     if page.reason:
@@ -458,11 +535,12 @@ def render_overrides(driver, selectors: dict) -> str:
         if not value:
             lines.append(f"{key}: 留空 → 使用自动识别")
             continue
-        try:
-            driver.find_element(By.CSS_SELECTOR, value)
-            lines.append(f"{key}: {value} → 命中")
-        except (NoSuchElementException, WebDriverException) as e:
-            lines.append(f"{key}: {value} → 没找到（{type(e).__name__}），会退回自动识别")
+        # 用和正式流程同一个查找函数，这样"命中"的含义完全一致
+        # （包括"多个匹配时优先取可见的那个"）。
+        el = _find_by_selector(driver, value, key)
+        lines.append(
+            f"{key}: {value} → {'命中' if el is not None else '没找到，会退回自动识别'}"
+        )
     return "\n".join(lines)
 
 
@@ -500,6 +578,26 @@ def _text(el) -> str:
         return ""
 
 
+def _nearby_text(el) -> str:
+    """元素附近的文字，最多往上找两层。
+
+    复选框自己是没有文字的（input 的 text 恒为空），它的说明文字在父节点或兄弟
+    节点里——实测页面上的"请先阅读并同意《用户协议》…"就摆在勾选框旁边的节点里。
+    两层还取不到就返回空串，调用方会退回"第一个复选框"的兜底逻辑。
+    """
+    node = el
+    for _ in range(2):
+        try:
+            node = node.find_element(By.XPATH, "..")
+            text = (node.text or "").strip()
+        except WebDriverException as e:
+            log.debug("读取元素附近文字失败: %s", e)
+            return ""
+        if text:
+            return text
+    return ""
+
+
 def _describe(el) -> dict:
     """把一个 WebElement 压成纯数据描述符。
 
@@ -511,10 +609,12 @@ def _describe(el) -> dict:
     except WebDriverException:
         size = {}
 
+    kind = _attr(el, "type").strip().lower()
+
     return {
         "index": -1,
         "tag": (el.tag_name or "").lower(),
-        "type": _attr(el, "type").strip().lower(),
+        "type": kind,
         "id": _attr(el, "id"),
         "name": _attr(el, "name"),
         "class": _attr(el, "class"),
@@ -522,6 +622,8 @@ def _describe(el) -> dict:
         "value": _attr(el, "value"),
         "src": _attr(el, "src"),
         "text": _text(el),
+        # 只有复选框需要：它的文字在旁边的节点里，其它元素用不上，省掉往返
+        "nearby": _nearby_text(el) if kind == "checkbox" else "",
         "visible": _visible(el),
         "size": (int(size.get("width") or 0), int(size.get("height") or 0)),
     }
@@ -638,6 +740,31 @@ def _navigate(driver, cfg: Config) -> bool:
         return True
 
 
+def _password_visible(driver) -> bool:
+    """页面上有没有可见的密码框。
+
+    先用字面的 input[type=password] 查：一次往返，实测真实门户命中。
+    查不到再退回"取所有 input、按 type 属性逐个判断"——有的前端框架不给 input 写
+    字面的 type 属性（实测本页的用户名框、验证码框都没有），那时 CSS 的 [type=...]
+    是匹配不上的，只能靠 get_attribute 兜底。多花的往返只在第一种查不到时才付。
+    """
+    try:
+        for el in driver.find_elements(By.CSS_SELECTOR, "input[type=password]"):
+            if _visible(el):
+                return True
+    except WebDriverException as e:
+        log.debug("查询密码框失败（页面可能还在跳转）: %s", e)
+
+    try:
+        for el in driver.find_elements(By.CSS_SELECTOR, "input"):
+            if _attr(el, "type").strip().lower() == "password" and _visible(el):
+                return True
+    except WebDriverException as e:
+        log.debug("兜底查询密码框失败: %s", e)
+
+    return False
+
+
 def _wait_for_password_field(driver, cfg: Config, deadline: float) -> None:
     """等密码框出现，最多等到 deadline。
 
@@ -646,9 +773,9 @@ def _wait_for_password_field(driver, cfg: Config, deadline: float) -> None:
     还没走完。只采一次的话，会把"还没画出来"错判成"不是登录页"，然后放弃整轮，
     而这一轮本来是可以成功的。
 
-    故意用一条只查密码框的 CSS 查询来轮询，而不是反复 _collect()：
-    _collect 会把每个 input/button/a/img 的属性都读一遍（几十次 WebDriver 往返），
-    半秒轮询一次太浪费；这里一次往返就够了。
+    用一条便宜的查询轮询，而不是反复 _collect()：_collect 会把每个
+    input/button/a/img 的属性都读一遍（几十次 WebDriver 往返），半秒轮询一次
+    太浪费。
 
     用户如果指定了 password 选择器就跳过等待——他既然知道页面长什么样，
     就按他给的来，不必猜。
@@ -657,40 +784,12 @@ def _wait_for_password_field(driver, cfg: Config, deadline: float) -> None:
         return
 
     while True:
-        try:
-            for el in driver.find_elements(By.CSS_SELECTOR, "input[type=password]"):
-                if _visible(el):
-                    return
-        except WebDriverException as e:
-            # 页面正在跳转时查询会失败，属正常，等下一轮
-            log.debug("等待登录表单时查询失败（页面可能还在跳转）: %s", e)
-
+        if _password_visible(driver):
+            return
         if time.monotonic() >= deadline:
             log.debug("等待密码框超时，按当前页面状态继续")
             return
         time.sleep(_FORM_WAIT_STEP)
-
-
-def _refresh_captcha(driver, image_el) -> None:
-    """换一张验证码。
-
-    优先点图片本身——门户一般给它挂了 onclick 刷新；点不动（元素已失效、
-    或者图片不可点击）就整页刷新兜底。整页刷新会把已填的内容清掉，所以放最后。
-    """
-    if image_el is not None:
-        try:
-            image_el.click()
-            time.sleep(_REFRESH_WAIT)
-            log.debug("已点击验证码图片刷新")
-            return
-        except WebDriverException as e:
-            log.debug("点击验证码图片失败，改为刷新页面: %s", e)
-
-    try:
-        driver.refresh()
-        time.sleep(_REFRESH_WAIT)
-    except WebDriverException as e:
-        log.debug("刷新页面失败（继续尝试）: %s", e)
 
 
 def _fill(el, value: str) -> None:
@@ -748,35 +847,76 @@ def _snapshot(driver) -> dict:
 
     return {
         "url": _current_url(driver),
-        "has_password": any(d["visible"] and d["type"] == "password" for d in controls),
+        "has_password": any(d["visible"] and _type_of(d) == "password" for d in controls),
         "has_username": any(_is_textish(d) for d in controls),
         "body_text": body_text,
     }
 
 
-def _resolve(driver, elements, override: str, finder, pool, kind: str):
-    """先按用户给的选择器找，找不到再退回启发式。
+def _find_by_selector(driver, selector: str, kind: str):
+    """按用户给的选择器找元素，多个匹配时优先返回第一个可见的。找不到返回 None。
 
-    覆盖项失配时只警告、不报错：用户在 config.json 里写错一个选择器，最坏的结果
-    应该是退回自动识别，而不是整个工具登不上网。
+    这条"优先可见"不是讲究，是实测出来的 bug：真实门户页面上
+    input[name=captcha_code] 同时匹配一个隐藏 input（name 一样的隐藏字段）和一个
+    可见的验证码输入框，而 find_element 返回的是文档顺序靠前的那个——隐藏的。
+    往里打字等于没打，验证码框始终是空的，于是每次都提交一个空验证码。
+
+    配的选择器匹配不到时返回 None，由调用方退回自动识别（失配只警告、不报错：
+    用户在 config.json 里写错一个选择器，最坏的结果应该是回到自动识别，
+    而不是整个工具登不上网）。
+
+    顺带一个坑：有的前端框架不给 input 写字面的 type 属性（实测本页的用户名框和
+    验证码框都没有），这时 CSS 的 [type=text] 匹配不上，只能靠 get_attribute 读。
+    用户写 [type=...] 又没匹配到时，这里会多给一句提示。
+    """
+    try:
+        found = driver.find_elements(By.CSS_SELECTOR, selector)
+    except WebDriverException as e:
+        log.warning("selectors.%s = %r 不是合法的选择器（%s），回退到自动识别",
+                    kind, selector, type(e).__name__)
+        return None
+
+    if not found:
+        hint = ""
+        if "[type=" in selector:
+            hint = ("；提示：有的输入框没有字面的 type 属性（本页用户名框、验证码框就是），"
+                    "把 [type=...] 换成 #id 或 [name=...] 更稳")
+        log.warning("selectors.%s = %r 在页面上没找到，回退到自动识别%s", kind, selector, hint)
+        return None
+
+    if len(found) == 1:
+        return found[0]
+
+    for position, el in enumerate(found, start=1):
+        if _visible(el):
+            log.info("selectors.%s = %r 匹配到 %d 个元素，选用第 %d 个（第一个可见的）",
+                     kind, selector, len(found), position)
+            return el
+
+    log.info("selectors.%s = %r 匹配到 %d 个元素，但都不可见，选用第 1 个",
+             kind, selector, len(found))
+    return found[0]
+
+
+def _resolve(driver, elements, override: str, desc: dict | None, kind: str):
+    """定一个字段该用哪个元素：配了覆盖选择器就用它，否则用启发式的结论。
+
+    覆盖项失配时只警告、不报错，退回启发式（见 _find_by_selector）。
     """
     if override:
-        try:
-            el = driver.find_element(By.CSS_SELECTOR, override)
-            log.debug("selectors.%s 命中: %s", kind, override)
-            return el, _describe(el)
-        except (NoSuchElementException, WebDriverException) as e:
-            log.warning("selectors.%s = %r 在页面上没找到（%s），回退到自动识别",
-                        kind, override, type(e).__name__)
-
-    desc = finder(pool)
+        el = _find_by_selector(driver, override, kind)
+        if el is not None:
+            return el
     if desc is None:
-        return None, None
-    return elements[desc["index"]], desc
+        return None
+    return elements[desc["index"]]
 
 
 def _attempt(driver, cfg: Config, password: str, nav_timed_out: bool, attempt: int):
-    """做一次完整的登录尝试，返回 (Result, 验证码图片元素)。"""
+    """做一次完整的登录尝试。
+
+    返回 (Result, 验证码图片元素, 验证码刷新元素)，后两个供下一轮刷新验证码用。
+    """
     # 先等表单画出来再采（见 _wait_for_password_field）。表单已经在页面上时这一步
     # 只花一次查询的代价。
     _wait_for_password_field(driver, cfg, time.monotonic() + cfg.probe_timeout)
@@ -786,10 +926,13 @@ def _attempt(driver, cfg: Config, password: str, nav_timed_out: bool, attempt: i
     images = [d for d in descriptors if d["tag"] == "img"]
     selectors = cfg.selectors
 
-    username_el, _ = _resolve(driver, elements,
-                              selectors.get("username", ""), pick_username, controls, "username")
-    password_el, _ = _resolve(driver, elements,
-                              selectors.get("password", ""), pick_password, controls, "password")
+    # 页面解析交给纯函数（纯函数层），这里只负责把结论映射回 WebElement。
+    page = locate(controls, images)
+
+    username_el = _resolve(driver, elements,
+                           selectors.get("username", ""), page.username, "username")
+    password_el = _resolve(driver, elements,
+                           selectors.get("password", ""), page.password, "password")
 
     if username_el is None or password_el is None:
         detail = _missing_detail(controls, images,
@@ -798,20 +941,24 @@ def _attempt(driver, cfg: Config, password: str, nav_timed_out: bool, attempt: i
         # 否则用户会去查"是不是登录页变了"，而真正的原因只是页面没加载完。
         reason = "timeout" if nav_timed_out else "not_login_page"
         log.error("第 %d 次尝试放弃: %s", attempt, detail)
-        return Result(False, reason, detail), None
+        return Result(False, reason, detail), None, None
 
-    # 页面解析交给纯函数，这里只负责把结论映射回 WebElement。
-    page = locate(controls, images)
-    if page.reason:
+    # 剩下唯一一种 page.reason 是"验证码只找到一半"。用户把验证码的两个选择器都
+    # 配好了就不适用这条——他的选择器会覆盖启发式，这时按配置继续。
+    if page.reason and not (selectors.get("captcha_image") and selectors.get("captcha_input")):
         log.error("第 %d 次尝试放弃: %s", attempt, page.detail)
-        return Result(False, page.reason, page.detail), None
+        return Result(False, page.reason, page.detail), None, None
 
-    image_el = _element_for(driver, elements,
-                            cfg.selectors.get("captcha_image", ""), page.captcha_image)
-    captcha_el = _element_for(driver, elements,
-                              cfg.selectors.get("captcha_input", ""), page.captcha_input)
-    submit_el = _element_for(driver, elements,
-                             cfg.selectors.get("submit", ""), page.submit)
+    image_el = _resolve(driver, elements, selectors.get("captcha_image", ""),
+                        page.captcha_image, "captcha_image")
+    captcha_el = _resolve(driver, elements, selectors.get("captcha_input", ""),
+                          page.captcha_input, "captcha_input")
+    reload_el = _resolve(driver, elements, selectors.get("captcha_reload", ""),
+                         page.captcha_reload, "captcha_reload")
+    agree_el = _resolve(driver, elements, selectors.get("agree", ""),
+                        page.agree, "agree")
+    submit_el = _resolve(driver, elements, selectors.get("submit", ""),
+                         page.submit, "submit")
 
     # 验证码必须在填密码之前抓：有些门户一输入密码就把验证码刷新掉。
     captcha_text = ""
@@ -821,12 +968,15 @@ def _attempt(driver, cfg: Config, password: str, nav_timed_out: bool, attempt: i
     ok_to_submit, why_not = decide_submit(captcha_el is not None, captcha_text)
     if not ok_to_submit:
         log.warning("第 %d 次尝试：%s", attempt, why_not)
-        return Result(False, "captcha_failed", why_not), image_el
+        return Result(False, "captcha_failed", why_not), image_el, reload_el
 
     _fill(username_el, cfg.username)
     _type_password(password_el, password)  # 注意：绝不记录 password 的值
     if captcha_el is not None:
         _fill(captcha_el, captcha_text)
+    # 勾选放在填完之后、提交之前：这是真实登录的动作顺序，也避免勾选触发的
+    # 重渲染把已经填好的内容弄乱。
+    _tick_agree(driver, agree_el)
 
     if submit_el is None:
         log.info("没找到提交按钮，改用回车提交")
@@ -842,26 +992,95 @@ def _attempt(driver, cfg: Config, password: str, nav_timed_out: bool, attempt: i
     snapshot = _snapshot(driver)
     ok, reason, detail = judge(snapshot)
     if ok:
-        return Result(True, reason, detail), image_el
+        return Result(True, reason, detail), image_el, reload_el
 
     log.warning("第 %d 次尝试未成功: %s", attempt, detail)
-    return Result(False, reason, detail), image_el
+    return Result(False, reason, detail), image_el, reload_el
 
 
-def _element_for(driver, elements, override: str, desc: dict | None):
-    """描述符 → WebElement。给了覆盖选择器就优先用覆盖的。
+def _js_click(driver, el) -> bool:
+    """用 JS 点击元素，成功返回 True。
 
-    覆盖项要单独走一次 find_element，因为它拿到的元素不在 descriptors 里。
+    这里不能用普通的 el.click()，实测两类元素都会失败：
+      - ant-design 的"同意用户协议"复选框把真实 input 藏起来了
+        （is_displayed() 为 False），普通 click 点不到；
+      - 验证码图片会被包着它的 <a class="code-reload-content"> 拦掉，报
+        ElementClickInterceptedException（浏览器认为点在那个 <a> 上）。
+    JS 点击直接把事件派发到元素上，两种情况都能过——实测复选框的
+    is_selected() 由 False 变成 True。
     """
-    if override:
-        try:
-            return driver.find_element(By.CSS_SELECTOR, override)
-        except (NoSuchElementException, WebDriverException) as e:
-            log.warning("selectors 里的选择器 %r 没找到（%s），回退到自动识别",
-                        override, type(e).__name__)
-    if desc is None:
+    try:
+        driver.execute_script("arguments[0].click()", el)
+        return True
+    except WebDriverException as e:
+        log.debug("JS 点击失败: %s", e)
+        return False
+
+
+def _clickable_ancestor(driver, el):
+    """离元素最近的可点击祖先（<a>）。没有就返回 None。"""
+    try:
+        return el.find_element(By.XPATH, "./ancestor::a[1]")
+    except (NoSuchElementException, WebDriverException):
         return None
-    return elements[desc["index"]]
+
+
+def _tick_agree(driver, el) -> None:
+    """勾上"同意用户协议"。
+
+    实测这个复选框并不控制提交按钮的可用状态（按钮一直是 enabled），所以它更像
+    一道校验而不是硬门槛；但 ant-design 的表单校验仍可能拦住提交，而且勾上它才是
+    真实登录时的动作，所以照勾。
+
+    勾不上不算致命：只警告、继续提交，让后面的判定去说明结果。
+    """
+    if el is None:
+        log.debug("页面上没找到「同意协议」勾选框，跳过")
+        return
+
+    try:
+        if el.is_selected():
+            log.info("用户协议勾选框已经是勾上的，不再点击")
+            return
+    except WebDriverException as e:
+        log.debug("读取勾选框状态失败（继续尝试点击）: %s", e)
+
+    if _js_click(driver, el):
+        log.info("已勾选用户协议勾选框")
+    else:
+        log.warning("勾选用户协议失败，继续提交（门户可能会因此拒绝）")
+
+
+def _refresh_captcha(driver, reload_el, image_el) -> None:
+    """换一张验证码。
+
+    顺序是有实测依据的：真正接收点击的是包着验证码图片的
+    <a class="code-reload-content">（文字"换一个"），直接点图片会被它拦掉
+    （ElementClickInterceptedException）。所以先点刷新控件，再退回点图片的
+    可点击祖先，再退回点图片本身，最后才是整页刷新——整页刷新会把已经填好的
+    内容清掉，所以放最后。
+    """
+    if reload_el is not None and _js_click(driver, reload_el):
+        time.sleep(_REFRESH_WAIT)
+        log.debug("已点击验证码刷新控件")
+        return
+
+    if image_el is not None:
+        ancestor = _clickable_ancestor(driver, image_el)
+        if ancestor is not None and _js_click(driver, ancestor):
+            time.sleep(_REFRESH_WAIT)
+            log.debug("已点击验证码图片外层的可点击祖先")
+            return
+        if _js_click(driver, image_el):
+            time.sleep(_REFRESH_WAIT)
+            log.debug("已点击验证码图片")
+            return
+
+    try:
+        driver.refresh()
+        time.sleep(_REFRESH_WAIT)
+    except WebDriverException as e:
+        log.debug("刷新页面失败（继续尝试）: %s", e)
 
 
 def _solve_captcha(image_el) -> str:
@@ -900,13 +1119,15 @@ def _attempt_loop(driver, cfg: Config, password: str, nav_timed_out: bool) -> Re
     """
     attempts = max(1, cfg.captcha_max_retry)
     image_el = None
+    reload_el = None
     last = Result(False, "captcha_failed", "没有执行任何尝试")
 
     for attempt in range(1, attempts + 1):
         if attempt > 1:
-            _refresh_captcha(driver, image_el)
+            # 换一张验证码再试（优先点"换一个"控件，点图片会被它拦掉）
+            _refresh_captcha(driver, reload_el, image_el)
 
-        last, image_el = _attempt(driver, cfg, password, nav_timed_out, attempt)
+        last, image_el, reload_el = _attempt(driver, cfg, password, nav_timed_out, attempt)
 
         if last.ok:
             log.info("登录成功（第 %d/%d 次尝试）", attempt, attempts)
