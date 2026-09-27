@@ -1962,6 +1962,12 @@ git commit -m "feat: 验证码获取与 ddddocr 本地识别"
 **这是全项目唯一受"抓包未取得"影响的模块。**
 `_submit()` 按锐捷 ePortal 标准接口实现。取得真实抓包后，Task 12 负责校对字段名。
 
+> **测试替身用法（写测试前先看这段）**
+>
+> - 断言提交了什么字段，直接读 `s.posts`（形如 `[(url, data), ...]`），**不要**再写子类去捕获 —— 替身已经原生记录了。
+> - 登录页地址将来若变成动态的（带 `flowSessionId` / `userIp` / `userMac`），路由改用**前缀形式** `[(url_prefix, response), ...]`，这样测试不必预先知道 query string。
+> - **凡是要验证"调用了几次"的地方，路由必须声明成 list 队列**（如 `[fail_resp, fail_resp, ok_resp]`）并断言 `len(s.calls)` / `len(s.posts)`。非 list 的路由是无限次返回同一个响应，对调用次数**没有任何约束** —— 而被测代码多提交一次正是本项目最需要拦住的 bug。
+
 - [ ] **Step 1: 写失败的测试**
 
 Create: `tests/test_portal.py`
@@ -2022,23 +2028,21 @@ def test_login_success(tmp_path, secret_file):
 
 
 def test_login_sends_expected_form_fields(tmp_path, secret_file):
-    captured = {}
+    """断言提交表单的字段，同时钉死"只提交一次"。
 
-    class S(FakeSession):
-        def post(self, url, data=None, **kw):
-            captured["url"] = url
-            captured["data"] = data
-            return super().post(url, data=data, **kw)
-
-    s = S({
+    只提交一次是这个项目的核心安全属性：学校的认证系统连续失败会锁账号，
+    而每一次多余的提交都在消耗重试额度。所以这里不顺带断言就不算测到位。
+    """
+    s = FakeSession({
         PAGE_URL: page_ok(),
         CAPTCHA_URL: FakeResponse(200, content=b"img"),
         SUBMIT_URL: FakeResponse(200, jsonp('{"result":"success"}')),
     })
     login(cfg(tmp_path), s, captcha_text="abcd")
 
-    assert captured["url"] == SUBMIT_URL
-    d = captured["data"]
+    assert len(s.posts) == 1, "一次 login() 只能提交一次登录表单"
+    url, d = s.posts[0]
+    assert url == SUBMIT_URL
     assert d["userId"] == "2021001"
     assert d["password"] == "pw123"
     assert d["validcode"] == "abcd"
@@ -2788,6 +2792,16 @@ git commit -m "fix: 按真实抓包校对提交接口字段"
 **Files:**
 - Create: `login.py`
 - Test: `tests/test_cli.py`
+
+> **本任务的重点是重试与防锁号，测试必须钉死"试了几次"。**
+> 这里最容易写出的坏测试是：把 `portal.login` 打桩成永远失败、断言最终返回 1 —— 那样
+> 无论代码重试 3 次还是 30 次都会通过，而"重试太多次把账号试锁"正是本任务存在的理由。
+> 所以：
+>
+> - 每次调用要用可计数的桩（如 `monkeypatch` 一个记录调用次数的函数），断言**精确次数**。
+> - 验证"验证码错 → 换一张重试"时，用 list 队列路由 `[bad, bad, ok]` 并断言
+>   `len(s.calls)`；用非 list 路由等于放弃对次数的约束。
+> - `bad_credentials` 那条路径要单独断言**调用次数为 1**（确定性失败不做任何重试）。
 
 - [ ] **Step 1: 写失败的测试**
 
