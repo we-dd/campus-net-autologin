@@ -1,3 +1,7 @@
+import os
+
+import pytest
+
 from src.state import State as FailState
 from src.state import clear, is_stopped, load, prune, record_failure, save
 
@@ -68,7 +72,44 @@ def test_save_and_load_roundtrip(tmp_path):
     assert load(p) == st
 
 
+def test_save_temp_name_is_per_process(tmp_path, monkeypatch):
+    """临时文件名必须区分进程。
+
+    固定的 path + ".tmp" 是所有进程共用的，手动跑一次撞上计划任务跑一次时两边会互相踩。
+    这里把 os.getpid 换成两个不同的值来模拟两个进程各存一次，断言两边用的临时文件名不同，
+    并确认成功路径上不留临时文件。
+    """
+    p = str(tmp_path / "state.json")
+    used = []
+    real_replace = os.replace
+
+    def spy(src, dst):
+        used.append(src)
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", spy)
+    monkeypatch.setattr(os, "getpid", lambda: 1111)
+    save(FailState(failures=[1.0]), p)
+    monkeypatch.setattr(os, "getpid", lambda: 2222)
+    save(FailState(failures=[2.0]), p)
+
+    assert len(set(used)) == 2, f"两个进程共用了同一个临时文件: {used}"
+    assert sorted(os.listdir(tmp_path)) == ["state.json"]
+
+
 def test_corrupt_state_file_is_ignored(tmp_path):
     p = tmp_path / "state.json"
     p.write_text("{oops", encoding="utf-8")
+    assert load(str(p)) == FailState()
+
+
+@pytest.mark.parametrize("content", ["[]", '"abc"', "123", "null"])
+def test_non_object_state_file_is_ignored(tmp_path, content):
+    """顶层不是 JSON 对象的 state.json 也按空状态处理。
+
+    真实场景：被停止自动登录后，用户会打开 state.json 想清空它，顺手写成 []。
+    这时若抛 AttributeError，整个运行会崩掉，而不是按损坏状态降级。
+    """
+    p = tmp_path / "state.json"
+    p.write_text(content, encoding="utf-8")
     assert load(str(p)) == FailState()
