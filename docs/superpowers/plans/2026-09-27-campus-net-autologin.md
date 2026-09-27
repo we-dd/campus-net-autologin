@@ -2251,7 +2251,7 @@ _BAD_CREDENTIAL_WORDS = ("密码", "用户名", "账号", "用户不存在", "pa
 @dataclass
 class Result:
     ok: bool
-    reason: str          # success | bad_captcha | bad_credentials | network | unknown
+    reason: str          # success | bad_captcha | bad_credentials | network | secret | unknown
     detail: str = ""
     captcha_image: bytes | None = None
 
@@ -2334,8 +2334,11 @@ def login(cfg: Config, session, captcha_text: str | None = None) -> Result:
     # 4. 提交
     try:
         payload = _build_payload(cfg, query_string, code)
-    except secret.SecretError as e:
-        return Result(False, "unknown", str(e), image)
+    except (secret.SecretError, ValueError) as e:
+        # 单独给一个 reason：这是"本地凭据文件不可用"，根本没有发出登录请求。
+        # 归到 "unknown" 会被 do_login 当成失败重试并计入锁号窗口，
+        # 最后弹出一个"避免账号被锁"的假警报——而真正的原因是密码文件要重做。
+        return Result(False, "secret", str(e), image)
 
     ok, message = _submit(session, cfg, payload)
     if ok:
@@ -3032,11 +3035,21 @@ def do_login(cfg, session, st, now: float) -> int:
         log.warning("登录失败 (%s): %s", res.reason, res.detail)
 
         if res.reason == "bad_credentials":
+            # 确定性失败，重试没有意义：每次都会真的打到认证服务器上，只会加速锁号。
+            # 而且它确实消耗了锁号预算，所以要计入。
             log.error("账号或密码错误，停止重试")
             notify.notify("校园网认证", f"账号或密码错误，已停止自动重试。\n{res.detail}")
             state.record_failure(st, now, cfg.window_hours, cfg.window_max_fail)
             state.save(st, cfg.state_path)
             return 1
+
+        if res.reason == "secret":
+            # 本地密码文件读不出来，**根本没有发出登录请求**。
+            # 所以：不重试、不计入锁号窗口（计了会弹"避免账号被锁"的假警报），
+            # 并且按环境错误退出 2，把 detail 里的补救办法（重跑 --setup）摆到弹窗上。
+            log.error("本地凭据不可用，停止重试: %s", res.detail)
+            notify.notify("校园网认证", f"本地密码文件不可用，无法自动登录。\n{res.detail}")
+            return 2
 
         if res.reason == "network":
             log.error("网络异常，本轮放弃")

@@ -91,9 +91,13 @@ def load(path: str = "config.json") -> Config
 ### 4.2 `secret.py`
 
 ```python
-def save_password(password: str, path: str = "secret.dat") -> None
-def load_password(path: str = "secret.dat") -> str
+def save_password(password: str, path: str) -> None
+def load_password(path: str) -> str
 ```
+
+路径是必填参数，不给默认值：真实调用方（`--setup`、`portal._build_payload`）传的都是 `cfg.secret_path`，
+而 `cfg.secret_path` 是按配置文件所在目录推导的，**不是当前工作目录**。给一个相对路径的默认值
+反而会诱导出"计划任务以 System32 为工作目录时把密码写到系统目录"这类问题。
 
 - 用 `ctypes` 直接调 Windows DPAPI 的 `CryptProtectData` / `CryptUnprotectData`
 - 不引入 `keyring`、`pywin32` 等额外依赖
@@ -156,12 +160,27 @@ def recognize(image_bytes: bytes) -> str
 @dataclass
 class Result:
     ok: bool
-    reason: str                    # "success" | "bad_captcha" | "bad_credentials" | "network" | "unknown"
+    reason: str                    # "success" | "bad_captcha" | "bad_credentials" | "network" | "secret" | "unknown"
     detail: str = ""
     captcha_image: bytes | None = None   # 带回去给弹窗兜底用
 
 def login(cfg: Config, session: requests.Session, captcha_text: str | None = None) -> Result
 ```
+
+`reason` 的取值决定 `do_login` 怎么处理，尤其是**要不要计入锁号窗口**：
+
+| reason | 是否重试 | 是否计入锁号窗口 | 退出码 |
+|---|---|---|---|
+| `success` | — | 清零 | 0 |
+| `bad_captcha` | 是（换一张） | 是 | 1 |
+| `bad_credentials` | **否** | **是**（确实打到了服务器） | 1 |
+| `network` | 是（1 次） | 是 | 1 |
+| `secret` | **否** | **否**（本地密码文件问题，根本没发出请求） | 2 |
+| `unknown` | 是 | 是 | 1 |
+
+`secret` 必须单独成一个 reason：把它归进 `unknown` 会导致密码文件坏掉时不停重试、耗掉锁号窗口，
+最后弹出「连续失败次数过多，已暂停自动登录，避免账号被锁」—— 一个**假警报**，
+而真正的原因（重新运行 `--setup`）反被埋掉。
 
 职责边界（**这是本设计的核心接口**）：
 
