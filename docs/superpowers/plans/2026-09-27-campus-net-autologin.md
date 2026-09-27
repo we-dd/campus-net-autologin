@@ -2375,8 +2375,13 @@ def login(cfg: Config, session, captcha_text: str | None = None) -> Result:
     # 4. 提交
     try:
         payload = _build_payload(cfg, query_string, code)
-    except (secret.SecretError, ValueError) as e:
-        # 单独给一个 reason：这是"本地凭据文件不可用"，根本没有发出登录请求。
+    except secret.SecretError as e:
+        # 只捕 SecretError：secret 模块保证它的每一个失败分支（文件不存在、
+        # 空文件、读不了、解不开、解出来不是 UTF-8、路径含 NUL、代理字符）
+        # 都收敛成 SecretError，所以这里不需要顺带捕 ValueError。
+        # 捕宽了反而会把 _build_payload 里将来可能出现的其它 ValueError 一并遮蔽掉。
+        #
+        # 单独给一个 reason 也是必须的：这是"本地凭据文件不可用"，根本没有发出登录请求。
         # 归到 "unknown" 会被 do_login 当成失败重试并计入锁号窗口，
         # 最后弹出一个"避免账号被锁"的假警报——而真正的原因是密码文件要重做。
         return Result(False, "secret", str(e), image)
