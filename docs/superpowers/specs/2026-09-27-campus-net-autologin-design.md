@@ -308,7 +308,9 @@ def notify(title: str, message: str) -> None
 
 ### 先导测试（第一步就做，决定后续路线）
 
-抓 50 张真实验证码图片存入 `samples\`，跑 `login.py --test-captcha 50`，统计 ddddocr 命中率。判定标准：
+抓 30 张真实验证码图片存入 `samples\`，**文件名写成图片里的字符**（如 `3f7k.png`，重名就加序号 `3f7k_1.png`）。存图的人本来就在看那几个字符，顺手命名即可，不需要额外逐张标注。
+
+然后跑 `login.py --test-captcha`，自动统计 ddddocr 命中率。判定标准：
 
 | 准确率 | 后续路线 |
 |---|---|
