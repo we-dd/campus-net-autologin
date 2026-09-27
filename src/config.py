@@ -36,6 +36,11 @@ _INT_FIELDS = ("captcha_max_retry", "run_max_fail", "window_hours",
                "window_max_fail", "probe_timeout")
 _OPTIONAL_URL_FIELDS = ("login_page_url", "login_submit_url", "captcha_url")
 
+# 日志级别只认这五个。故意不用 logging.getLevelNamesMapping()：那张表里有 NOTSET
+# （值是 0），填了它 root logger 的级别就变成 0，DEBUG 及以下会全部涌进 1 MiB 的
+# 轮转日志；FATAL / WARN 这类别名也不放进来，用户没有理由手写它们。
+_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
 # 配置文件里允许出现的键，用于识别拼错的键（见 _warn_unknown_keys）。
 _KNOWN_KEYS = frozenset(
     ("username", "portal", "probe_urls", "log_level")
@@ -227,10 +232,10 @@ def load(path: str = "config.json") -> Config:
 
     if "log_level" in kwargs:
         level_name = kwargs["log_level"].strip().upper()
-        if level_name not in logging.getLevelNamesMapping():
+        if level_name not in _LOG_LEVELS:
             raise ConfigError(
                 f"{where} 字段 log_level 取值非法: {_show(kwargs['log_level'])}，"
-                f"常用取值是 DEBUG / INFO / WARNING / ERROR"
+                f"只能是 {' / '.join(_LOG_LEVELS)}"
             )
         kwargs["log_level"] = level_name
 

@@ -279,11 +279,43 @@ def jsonp(obj: str) -> str:
 - [ ] **Step 2: 写 tests/conftest.py**
 
 ```python
+import logging
 import sys
 from pathlib import Path
 
+import pytest
+
 # 让 tests 里可以 `from src.xxx import yyy`
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
+@pytest.fixture(autouse=True)
+def _restore_root_logger():
+    """每个用例跑完后，把 root logger 还原成本用例开始前的样子。
+
+    logsetup.init() 把 handler 挂在 root logger 上，并把路径记在模块级的
+    _configured 里，两者都活过整个 pytest 会话；而每个用例用的是新的 tmp_path。
+    不还原的话 handler 会随用例数一路累积：日志重复写、旧临时文件被句柄占住删不掉，
+    在 Windows 上就会变成难查的顺序相关失败。所以这段别当噪音删掉。
+    """
+    from src import logsetup
+
+    root = logging.getLogger()
+    handlers_before = list(root.handlers)
+    configured_before = set(logsetup._configured)
+
+    yield
+
+    # 让用例之间互不影响：用过哪些日志路径也要还原
+    logsetup._configured.clear()
+    logsetup._configured.update(configured_before)
+
+    # 只清掉本用例新增的 handler，并 close 掉以释放文件句柄
+    for handler in list(root.handlers):
+        if handler not in handlers_before:
+            root.removeHandler(handler)
+            handler.close()
+    root.handlers[:] = handlers_before
 ```
 
 - [ ] **Step 3: 写一个自检测试**
@@ -750,6 +782,18 @@ def test_invalid_log_level_raises(tmp_path):
         load(write(tmp_path, minimal(log_level="VERBOSE")))
 
 
+@pytest.mark.parametrize("bad_level", ["NOTSET", "FATAL", "WARN", "notset"])
+def test_disallowed_log_level_raises(tmp_path, bad_level):
+    """NOTSET 在 getLevelNamesMapping() 里（值为 0），放过去会把 root 级别设成 0
+    并让 DEBUG 及以下全部写进 1 MiB 的轮转日志，所以这里明确不认它。"""
+    with pytest.raises(ConfigError, match="log_level"):
+        load(write(tmp_path, minimal(log_level=bad_level)))
+
+
+def test_lowercase_log_level_is_normalized(tmp_path):
+    assert load(write(tmp_path, minimal(log_level="critical"))).log_level == "CRITICAL"
+
+
 def test_unknown_key_warns_with_suggestion(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="src.config"):
         cfg = load(write(tmp_path, minimal(captcha_max_retrys=7)))
@@ -814,6 +858,11 @@ _STR_FIELDS = ("log_level",)
 _INT_FIELDS = ("captcha_max_retry", "run_max_fail", "window_hours",
                "window_max_fail", "probe_timeout")
 _OPTIONAL_URL_FIELDS = ("login_page_url", "login_submit_url", "captcha_url")
+
+# 日志级别只认这五个。故意不用 logging.getLevelNamesMapping()：那张表里有 NOTSET
+# （值是 0），填了它 root logger 的级别就变成 0，DEBUG 及以下会全部涌进 1 MiB 的
+# 轮转日志；FATAL / WARN 这类别名也不放进来，用户没有理由手写它们。
+_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
 # 配置文件里允许出现的键，用于识别拼错的键（见 _warn_unknown_keys）。
 _KNOWN_KEYS = frozenset(
@@ -1006,10 +1055,10 @@ def load(path: str = "config.json") -> Config:
 
     if "log_level" in kwargs:
         level_name = kwargs["log_level"].strip().upper()
-        if level_name not in logging.getLevelNamesMapping():
+        if level_name not in _LOG_LEVELS:
             raise ConfigError(
                 f"{where} 字段 log_level 取值非法: {_show(kwargs['log_level'])}，"
-                f"常用取值是 DEBUG / INFO / WARNING / ERROR"
+                f"只能是 {' / '.join(_LOG_LEVELS)}"
             )
         kwargs["log_level"] = level_name
 
@@ -1046,7 +1095,7 @@ def load(path: str = "config.json") -> Config:
 python -m pytest tests/test_config.py -v
 ```
 
-Expected: 39 passed
+Expected: 44 passed
 
 - [ ] **Step 5: Commit**
 

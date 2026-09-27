@@ -190,6 +190,18 @@ def test_invalid_log_level_raises(tmp_path):
         load(write(tmp_path, minimal(log_level="VERBOSE")))
 
 
+@pytest.mark.parametrize("bad_level", ["NOTSET", "FATAL", "WARN", "notset"])
+def test_disallowed_log_level_raises(tmp_path, bad_level):
+    """NOTSET 在 getLevelNamesMapping() 里（值为 0），放过去会把 root 级别设成 0
+    并让 DEBUG 及以下全部写进 1 MiB 的轮转日志，所以这里明确不认它。"""
+    with pytest.raises(ConfigError, match="log_level"):
+        load(write(tmp_path, minimal(log_level=bad_level)))
+
+
+def test_lowercase_log_level_is_normalized(tmp_path):
+    assert load(write(tmp_path, minimal(log_level="critical"))).log_level == "CRITICAL"
+
+
 def test_unknown_key_warns_with_suggestion(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="src.config"):
         cfg = load(write(tmp_path, minimal(captcha_max_retrys=7)))
