@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+samples/
+secret.dat
+state.json
+campus-net.log
+campus-net.log.1
