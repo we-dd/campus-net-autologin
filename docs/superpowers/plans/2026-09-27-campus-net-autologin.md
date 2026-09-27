@@ -1792,8 +1792,10 @@ def test_old_failures_expire_out_of_window():
     for i in range(3):
         record_failure(st, now=1000.0 + i, window_hours=6, window_max_fail=3)
     assert st.stopped is True
-    # 6 小时后
-    prune(st, now=1000.0 + 6 * HOUR + 1, window_hours=6)
+    # 从最后一次失败算起再过满 6 小时，记录才全部过期。
+    # 基准是最后一次失败的时间（1000.0 + 2），不是第一次——按第一次算会少 2 秒，
+    # 留下两条未过期的记录。
+    prune(st, now=(1000.0 + 2) + 6 * HOUR + 1, window_hours=6)
     assert st.failures == []
     assert st.stopped is False
 
