@@ -146,7 +146,7 @@ def fetch_image(session: requests.Session, cfg: Config) -> bytes
 def recognize(image_bytes: bytes) -> str
 ```
 
-- `fetch_image`：带着与登录同一个 `Session` 去请求验证码图片接口，返回原始字节（同时落盘到 `samples/` 便于日后评估）
+- `fetch_image`：带着与登录同一个 `Session` 去请求验证码图片接口，返回原始字节。**不落盘** —— 样本由人工在登录页上另存（见第 10 节），脚本不该在每次后台运行时往 `samples/` 里堆图片
 - `recognize`：用 ddddocr 本地识别，返回识别出的字符串（去空白）
 - ddddocr 只初始化一次（模型加载有开销），模块级单例
 
@@ -156,8 +156,9 @@ def recognize(image_bytes: bytes) -> str
 @dataclass
 class Result:
     ok: bool
-    reason: str        # "success" | "bad_captcha" | "bad_credentials" | "network" | "unknown"
-    detail: str
+    reason: str                    # "success" | "bad_captcha" | "bad_credentials" | "network" | "unknown"
+    detail: str = ""
+    captcha_image: bytes | None = None   # 带回去给弹窗兜底用
 
 def login(cfg: Config, session: requests.Session, captcha_text: str | None = None) -> Result
 ```
@@ -199,7 +200,7 @@ def notify(title: str, message: str) -> None
 | `--check` | 供计划任务调用。按 4.3 的四种状态分流；`ONLINE` 时静默退出，`PORTAL_DOWN`/`UNKNOWN` 只记日志，`UNAUTHED` 才执行登录 |
 | `--login` | 强制登录一次，跳过探测。手动调试用 |
 | `--setup` | 交互式保存账号/密码（密码走 DPAPI） |
-| `--test-captcha N` | 抓 N 张验证码做识别准确率统计，输出命中率。用于第 10 节的先导测试 |
+| `--test-captcha` | **读本地 `samples/` 目录**里人工存的验证码，统计识别准确率并给出路线判定。用于第 10 节的先导测试。**不联网抓图**——先导测试的全部意义就是别去打扰认证服务器 |
 
 退出码约定：`0` 已在线或登录成功；`1` 登录失败；`2` 配置/环境错误。便于任务计划与手工排查。
 
