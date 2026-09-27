@@ -41,12 +41,17 @@ kernel32.LocalFree.restype = wintypes.HLOCAL
 
 # DPAPI 的 dwFlags 参数。绝不能传 0。
 #
-# 0 表示允许 DPAPI 在需要时做交互式解析（弹 UI / 走凭据界面）。本脚本由计划任务
-# 每 30 分钟以非交互方式拉起，一旦 secret.dat 头部 dwFlags 字段（偏移 40，
-# 共 4 字节）被改坏哪怕一个 bit，CryptUnprotectData 就会一直阻塞、永不返回
-# （实测 25 秒仍未返回，且不占 CPU，不是死循环），直到计划任务的执行上限把进程
-# 杀掉 —— 于是每次运行都登不上网。传入 CRYPTPROTECT_UI_FORBIDDEN 后，同样的
-# 文件会在 2 毫秒内返回错误 1325，由调用方按普通解密失败处理。
+# 0 允许 DPAPI 做交互式解析（弹 UI / 走凭据界面）。本脚本由计划任务每 30 分钟以
+# 非交互方式拉起，一旦 secret.dat 头部 dwFlags 字段（偏移 40，共 4 字节）里
+# CRYPTPROTECT_PROMPT_ON_UNPROTECT / ON_PROTECT 这两位（0x1、0x2）被置起来，
+# CryptUnprotectData 就会一直阻塞、永不返回（实测 25 秒未返回，且不占 CPU，
+# 不是死循环），直到计划任务把进程杀掉 —— 于是每次运行都登不上网。
+# 传 1 之后，同一份文件 13 毫秒内返回错误 1325，按普通解密失败处理。
+# （8 种单 bit 模式都扫过：只有 0x1、0x2 这两个 PROMPT 位会卡住，
+#  0x04 / 0x08 / 0x10 / 0x20 / 0x40 / 0x80 都快速报错。）
+#
+# 别被密文骗了：DPAPI 不会把 UI_FORBIDDEN 写回文件，正常的 secret.dat 在偏移 40
+# 处读出来仍然是 00 00 00 00。看到 0 不代表这个常量没生效，不要据此改回 0。
 _CRYPTPROTECT_UI_FORBIDDEN = 1
 
 
@@ -75,7 +80,7 @@ def _protect(data: bytes) -> bytes:
         kernel32.LocalFree(out_blob.pbData)
 
 
-def _unprotect(data: bytes) -> bytes:
+def _unprotect(data: bytes, path: str) -> bytes:
     in_blob, _keep = _make_blob(data)
     out_blob = DATA_BLOB()
     ok = crypt32.CryptUnprotectData(
@@ -83,15 +88,14 @@ def _unprotect(data: bytes) -> bytes:
         _CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(out_blob),
     )
     if not ok:
-        # 错误码随损坏方式而变，没有哪个单独指向"账户不对"（本机实测：非 DPAPI 密文
-        # → 87，文件被截断 → 87，密文正文被改坏 → 13；别处也见过 -2146893813）。
-        # 所以先说最可能的原因和对策，"换过账户"只作为另一种可能提一句 ——
-        # 否则用户会去找一个并不存在的账户问题。
+        # 错误码随损坏方式而变（实测 87 / 13 / -2146893813 都出现过），没有哪个单独
+        # 指向"账户不对"。用户看不懂错误码，所以先把最常见的原因和对策说清楚，
+        # 代码放最后括号里备查。
         raise SecretError(
-            f"解密失败，错误码 {ctypes.get_last_error()}。"
-            "密码文件读不出来，多半是文件已损坏或不是本程序生成的，"
-            "请重新运行 python login.py --setup 生成一个；"
-            "若这个文件是从别的 Windows 账户或别的机器上拷来的，同样解不开，需要在本机重新生成。"
+            f"密码文件解密失败: {path}。"
+            "多半是文件已损坏或不是本程序生成的，请重新运行 python login.py --setup 重新生成；"
+            "从别的 Windows 账户或别的机器上拷来的文件同样解不开。"
+            f"（错误码 {ctypes.get_last_error()}）"
         )
     try:
         return ctypes.string_at(out_blob.pbData, out_blob.cbData)
@@ -100,14 +104,16 @@ def _unprotect(data: bytes) -> bytes:
 
 
 def save_password(password: str, path: str) -> None:
-    blob = _protect(password.encode("utf-8"))
-    # 目录或文件不可写时 open() 抛的是 OSError（如把目录当文件写、没权限），
-    # 调用方只 catch SecretError，所以这里统一转成 SecretError。
+    # 这一段里的失败都转成 SecretError：调用方（login.py --setup）只 catch 它。
+    # password.encode 会抛 UnicodeEncodeError（孤立代理字符，比如从重定向的标准输入
+    # 混进来的 \ud800），路径里有 NUL 时 open 抛 ValueError，权限不足或把目录当
+    # 文件写时抛 OSError。
     try:
+        blob = _protect(password.encode("utf-8"))
         os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
         with open(path, "wb") as f:
             f.write(blob)
-    except OSError as e:
+    except (OSError, ValueError) as e:
         raise SecretError(f"密码写入失败: {path}（{e}）") from e
     log.info("密码已加密保存到 %s", path)
 
@@ -123,4 +129,13 @@ def load_password(path: str) -> str:
         raise SecretError(f"密码文件读取失败: {path}（{e}）") from e
     if not blob:
         raise SecretError(f"密码文件是空的: {path}。请重新运行 python login.py --setup")
-    return _unprotect(blob).decode("utf-8")
+    try:
+        return _unprotect(blob, path).decode("utf-8")
+    except UnicodeDecodeError as e:
+        # 密文能解开却不是 UTF-8：本模块写进去的一定是 UTF-8，所以这文件不是本程序生成的。
+        # 不接住的话 UnicodeDecodeError 会漏过 portal.login 的 SecretError 兜底，一路冒到
+        # login.py 的通用 except（那里不弹窗），在计划任务下变成静默失败。
+        raise SecretError(
+            f"密码文件解密失败: {path}。解出来的内容不是 UTF-8 文本，多半不是本程序生成的，"
+            "请重新运行 python login.py --setup 重新生成。"
+        ) from e

@@ -35,25 +35,25 @@ def test_corrupt_file_raises_readable_error(tmp_path):
 
 
 def test_both_calls_forbid_ui(monkeypatch, tmp_path):
-    """钉死 dwFlags 必须是 CRYPTPROTECT_UI_FORBIDDEN（1），两个方向都要。
+    """钉死 dwFlags：两个方向都必须传 CRYPTPROTECT_UI_FORBIDDEN（1）。
 
-    传 0 等于允许 DPAPI 做交互式解析：只要 secret.dat 头部 dwFlags 字段
-    （偏移 40）被改坏一个 bit，CryptUnprotectData 就会一直阻塞不返回
-    （实测 25 秒仍未返回，且不占 CPU）；换成 1 之后，同一个文件 2 毫秒内
-    返回错误 1325。本脚本由计划任务每 30 分钟拉起一次，卡住就等于永远登不上网，
-    所以这个参数必须钉死，不能让以后的重构悄悄改回 0。
+    传 0 会永久阻塞的原因见 src/secret.py 里那个常量的注释，这里不重复，
+    免得同一个理由要在两处维护。断言用的是字面量 1（不是常量本身），
+    这样连"常量被改成别的值"也一起钉住。
     """
     real = secret.crypt32
     seen = []
 
     class SpyCrypt32:
-        """把 dwFlags（第 6 个位置参数，下标 5）记下来，其余原样转发。"""
+        """记下 dwFlags（第 6 个位置参数，下标 5），其余原样转发。"""
 
         def CryptProtectData(self, *args):
+            assert len(args) == 7, f"CryptProtectData 该传 7 个位置参数，实际 {len(args)}"
             seen.append(("CryptProtectData", args[5]))
             return real.CryptProtectData(*args)
 
         def CryptUnprotectData(self, *args):
+            assert len(args) == 7, f"CryptUnprotectData 该传 7 个位置参数，实际 {len(args)}"
             seen.append(("CryptUnprotectData", args[5]))
             return real.CryptUnprotectData(*args)
 
@@ -64,6 +64,7 @@ def test_both_calls_forbid_ui(monkeypatch, tmp_path):
     assert load_password(p) == "hunter2"
 
     assert seen == [("CryptProtectData", 1), ("CryptUnprotectData", 1)]
+    assert secret._CRYPTPROTECT_UI_FORBIDDEN == 1, "Win32 里 CRYPTPROTECT_UI_FORBIDDEN 就是 1"
 
 
 def test_load_directory_raises_secret_error(tmp_path):
@@ -75,3 +76,28 @@ def test_load_directory_raises_secret_error(tmp_path):
 def test_save_to_directory_raises_secret_error(tmp_path):
     with pytest.raises(SecretError, match="写入失败"):
         save_password("hunter2", str(tmp_path))
+
+
+def test_non_utf8_blob_raises_secret_error(tmp_path):
+    """密文解得开、内容却不是 UTF-8 时，同样要变成 SecretError。
+
+    以前这里漏成 UnicodeDecodeError：它不是 SecretError，会漏过 portal.login 的
+    兜底，冒到 login.py 的通用 except（那里不弹窗），计划任务下就成了静默失败 ——
+    用户只看到网络一直是断的，没有任何提示。
+    """
+    p = tmp_path / "secret.dat"
+    p.write_bytes(secret._protect(b"\xff\xfe\x80 not utf-8"))
+    with pytest.raises(SecretError, match="不是 UTF-8"):
+        load_password(str(p))
+
+
+def test_path_with_nul_raises_secret_error():
+    """手改的 config.json 里 secret_path 可能带 NUL，open() 抛的是 ValueError。"""
+    with pytest.raises(SecretError, match="写入失败"):
+        save_password("hunter2", "a\0b.dat")
+
+
+def test_surrogate_password_raises_secret_error(tmp_path):
+    """孤立代理字符（重定向标准输入绕开 getpass 时可能出现）encode 会抛 UnicodeEncodeError。"""
+    with pytest.raises(SecretError, match="写入失败"):
+        save_password("\ud800", str(tmp_path / "secret.dat"))
