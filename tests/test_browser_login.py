@@ -13,6 +13,7 @@ import pytest
 from selenium.common.exceptions import (
     InvalidSelectorException,
     NoSuchElementException,
+    StaleElementReferenceException,
     WebDriverException,
 )
 
@@ -89,14 +90,25 @@ class _StubElement:
     """给驱动层那几个函数用的元素替身。
 
     只实现被真正调用的几个接口：find_element（找可点击祖先）、is_selected、
-    is_displayed。用身份比较来断言"点的是哪一个"，所以不需要更多行为。
+    is_displayed、clear。用身份比较来断言"点的是哪一个"，所以不需要更多行为。
     """
 
-    def __init__(self, name, ancestor=None, selected=False, displayed=True):
+    tag_name = "input"
+    size = {"width": 10, "height": 10}
+    text = ""
+
+    def __init__(self, name, ancestor=None, selected=False, displayed=True,
+                 attrs=None):
         self.name = name
         self._ancestor = ancestor
         self._selected = selected
         self._displayed = displayed
+        self._attrs = {"type": "text", "id": name}
+        self._attrs.update(attrs or {})
+        self.cleared = False
+
+    def get_attribute(self, attr):
+        return self._attrs.get(attr)
 
     def find_element(self, by, value):
         if self._ancestor is None:
@@ -109,31 +121,94 @@ class _StubElement:
     def is_displayed(self):
         return self._displayed
 
+    def clear(self):
+        self.cleared = True
+
     def __repr__(self):
         return f"<{self.name}>"
 
 
-class _StubDriver:
-    """假 driver：记录 JS 点击了哪个元素、整页刷新了几次，并按配置回答 find_elements。"""
+class _StaleElement:
+    """一碰就 stale 的元素：模拟"页面在采集过程中重渲染"。
 
-    def __init__(self, found=None, js_ok=True):
+    size / tag_name 是本地属性不会抛，属性读取和可见性判断会抛
+    StaleElementReferenceException —— 跟真实情况一样。
+    """
+
+    tag_name = "input"
+    size = {"width": 10, "height": 10}
+
+    def get_attribute(self, name):
+        raise StaleElementReferenceException("stale element reference")
+
+    def is_displayed(self):
+        raise StaleElementReferenceException("stale element reference")
+
+
+class _StubDriver:
+    """假 driver：记录 JS 点击/整页刷新/脚本调用，并按配置回答 find_elements、
+    readyState 和 current_url。
+    """
+
+    def __init__(self, found=None, js_ok=True, ready_state="complete",
+                 changing=False, attached=True):
         self.js_clicks = []
         self.refreshes = 0
+        self.script_calls = []
+        self.ready_state = ready_state
         self._found = [] if found is None else found
         self._js_ok = js_ok
+        self._attached = attached
+        self._changing = changing
+        self._seq = 0
+
+    @property
+    def current_url(self):
+        """changing=True 时每次读都换一个地址，用来模拟"跳转链还没走完"。"""
+        if not self._changing:
+            return "http://portal/login"
+        self._seq += 1
+        return f"http://portal/step{self._seq}"
 
     def find_elements(self, by, value):
         if isinstance(self._found, Exception):
             raise self._found
         return list(self._found)
 
-    def execute_script(self, script, el):
+    def execute_script(self, script, *args):
+        self.script_calls.append(script)
+        if "readyState" in script:
+            return self.ready_state
         if not self._js_ok:
             raise WebDriverException("blocked")
-        self.js_clicks.append(el)
+        if ".click()" in script:
+            self.js_clicks.append(args[0])
+            return None
+        # document.contains 之类的探针
+        return self._attached
 
     def refresh(self):
         self.refreshes += 1
+
+
+class _StubDumpDriver:
+    """给 _dump_failure 用的假 driver：记录清空动作和截图路径，吐预置的页面源码。"""
+
+    def __init__(self, source="", password_fields=(), screenshot_ok=True):
+        self.page_source = source
+        self._password_fields = list(password_fields)
+        self._screenshot_ok = screenshot_ok
+        self.screenshot_path = None
+
+    def find_elements(self, by, value):
+        return self._password_fields
+
+    def save_screenshot(self, path):
+        self.screenshot_path = path
+        if self._screenshot_ok:
+            with open(path, "wb") as f:
+                f.write(b"\x89PNG fake")
+        return self._screenshot_ok
 
 
 # --- 真实门户页面的形状 ------------------------------------------------------
@@ -579,57 +654,62 @@ def test_press_enter_does_not_leak_the_password_through_the_exception():
     assert "Sup3rSecret" not in str(excinfo.value)
 
 
-def test_wait_for_password_field_returns_as_soon_as_the_form_appears():
-    """表单已经在页面上时，这一步只该花一次查询的代价，不能白等。"""
+def test_settle_returns_once_the_url_stops_changing(monkeypatch):
+    """地址连续几次采样都不变，就算稳定了。
 
-    class _El:
-        def is_displayed(self):
-            return True
+    这一步修的是真机那次崩溃：导航后 0.5 秒就去采集元素，采到一半 Angular 把整页
+    重渲染了一遍，手里所有句柄一起失效。
+    """
+    monkeypatch.setattr(browser_login, "_SETTLE_STEP", 0)
+    driver = _StubDriver()
 
-    class _Driver:
-        def __init__(self):
-            self.queries = 0
-
-        def find_elements(self, by, value):
-            self.queries += 1
-            return [_El()]
-
-    driver = _Driver()
-    started = time.monotonic()
-    browser_login._wait_for_password_field(
-        driver, SimpleNamespace(selectors={}), time.monotonic() + 10)
-
-    assert driver.queries == 1
-    assert time.monotonic() - started < 1
+    assert browser_login._wait_for_settle(driver, time.monotonic() + 5, 5) is True
+    assert any("readyState" in script for script in driver.script_calls)
 
 
-def test_wait_for_password_field_gives_up_at_the_deadline():
-    """页面上压根没有密码框时必须按时放弃。
+def test_settle_gives_up_with_a_clear_log_when_the_url_keeps_changing(monkeypatch, caplog):
+    """地址一直在变（跳转链还没走完）时要按时放弃，并且日志要说明白是"没等到稳定"，
+    而不是留下一句莫名其妙的失败。"""
+    monkeypatch.setattr(browser_login, "_SETTLE_STEP", 0)
+    driver = _StubDriver(changing=True)
 
-    脚本是计划任务每 30 分钟拉起的短命进程，一个不肯超时的等待会把上一轮的进程
-    一直留在那里。"""
+    with caplog.at_level(logging.WARNING, logger="src.browser_login"):
+        ok = browser_login._wait_for_settle(driver, time.monotonic() + 0.01, 20)
 
-    class _Driver:
-        def find_elements(self, by, value):
-            return []
-
-    started = time.monotonic()
-    browser_login._wait_for_password_field(
-        _Driver(), SimpleNamespace(selectors={}), time.monotonic() + 1)
-    elapsed = time.monotonic() - started
-
-    assert 1 <= elapsed < 5
+    assert ok is False
+    assert "等待页面稳定超时" in caplog.text
+    assert "readyState" in caplog.text
 
 
-def test_wait_for_password_field_is_skipped_when_the_user_set_a_selector():
-    """用户指定了 password 选择器就不用猜页面长什么样，也不该白等。"""
+def test_settle_waits_while_the_document_is_still_loading(monkeypatch):
+    monkeypatch.setattr(browser_login, "_SETTLE_STEP", 0)
+    driver = _StubDriver(ready_state="loading")
+    assert browser_login._wait_for_settle(driver, time.monotonic() + 0.01, 20) is False
 
-    class _Driver:
-        def find_elements(self, by, value):
-            raise AssertionError("指定了 password 选择器时不该去猜")
 
-    browser_login._wait_for_password_field(
-        _Driver(), SimpleNamespace(selectors={"password": "#pwd"}), time.monotonic() + 10)
+def test_ready_wait_still_settles_even_when_a_password_selector_is_configured(monkeypatch):
+    """配了 password 选择器只是跳过"等密码框"这一步。页面稳不稳定跟有没有选择器
+    毫无关系，所以等稳定**不能**一起跳过——真机那次就是没等稳定才崩的。"""
+    monkeypatch.setattr(browser_login, "_SETTLE_STEP", 0)
+    monkeypatch.setattr(browser_login, "_FORM_WAIT_STEP", 0)
+    driver = _StubDriver(found=[])          # 页面上一个元素都没有
+
+    browser_login._wait_until_ready(
+        driver, SimpleNamespace(selectors={"password": "#pwd"}), time.monotonic() + 5, 5)
+
+    assert any("readyState" in script for script in driver.script_calls)
+
+
+def test_ready_wait_waits_for_the_password_field_when_nothing_is_configured(monkeypatch, caplog):
+    monkeypatch.setattr(browser_login, "_SETTLE_STEP", 0)
+    monkeypatch.setattr(browser_login, "_FORM_WAIT_STEP", 0)
+    driver = _StubDriver(found=[])
+
+    with caplog.at_level(logging.WARNING, logger="src.browser_login"):
+        browser_login._wait_until_ready(
+            driver, SimpleNamespace(selectors={}), time.monotonic() + 0.01, 20)
+
+    assert "等不到登录表单" in caplog.text
 
 
 def test_build_driver_silences_the_loggers_that_would_leak_the_password(monkeypatch):
@@ -1041,3 +1121,295 @@ def test_report_paths_survive_a_missing_type_key():
     assert page.reason == "not_login_page"
     assert "密码输入框" in page.detail
     assert "type" in render_elements(controls)
+
+
+# ===========================================================================
+# 页面重渲染（stale element reference）
+#
+# 背景：第一次真机运行（真实门户，Angular SPA）以 stale 崩掉——导航后 0.5 秒去
+# 采集元素，采到一半页面整页重渲染，手里所有句柄一起失效。下面这些用例钉住
+# "不要把这类失败当成普通失败"和"不要把密码漏进现场转储"。
+# ===========================================================================
+
+
+def test_collect_refuses_a_snapshot_taken_while_the_page_re_rendered():
+    """采集到一半元素失效时，清单是残缺的（失效的那些属性全空）。
+
+    这种清单拿去判定会得出错误结论——"这页不是登录页"——比崩溃更难查。
+    所以必须明确作废，让上层重来一轮。
+    """
+    driver = _StubDriver(found=[_StaleElement()])
+
+    with pytest.raises(browser_login._PageChanged):
+        browser_login._collect(driver)
+
+
+def test_describe_marks_a_stale_element_instead_of_faking_empty_attributes():
+    """失效的元素不能伪装成"属性全空但存在"的普通元素。"""
+    desc = _describe(_StaleElement())
+
+    assert desc.get("stale") is True
+    assert "type" not in desc
+
+
+def test_collect_is_fine_when_nothing_goes_stale():
+    driver = _StubDriver(found=[_StubElement("ok")])
+    elements, descriptors = browser_login._collect(driver)
+
+    assert len(elements) == len(descriptors) == 1
+    assert not any(d.get("stale") for d in descriptors)
+
+
+def test_still_attached_asks_the_document():
+    """用一次 JS 调用判断句柄还挂着没有，比重新采集一遍便宜得多。"""
+    assert browser_login._still_attached(
+        _StubDriver(attached=True), _StubElement("e")) is True
+    assert browser_login._still_attached(
+        _StubDriver(attached=False), _StubElement("e")) is False
+
+
+def test_still_attached_treats_a_stale_handle_as_gone():
+    """句柄已经 stale 时 execute_script 本身就会抛——那也是"不可用"。"""
+    assert browser_login._still_attached(
+        _StubDriver(js_ok=False), _StubElement("e")) is False
+
+
+def test_require_alive_raises_page_changed_for_a_dead_handle():
+    with pytest.raises(browser_login._PageChanged):
+        browser_login._require_alive(
+            _StubDriver(attached=False), _StubElement("e"), "账号输入框")
+
+
+def test_require_alive_ignores_a_field_this_page_does_not_have():
+    """el 为 None（本页没有这个字段）时不该报错。"""
+    browser_login._require_alive(_StubDriver(attached=False), None, "同意协议勾选框")
+
+
+# --- stale 必须保持"可重试"，不能被包成别的异常 -----------------------------
+
+
+def test_typing_a_password_keeps_stale_retryable():
+    """stale 必须原样往外抛。
+
+    包成 _PasswordSendError 会让一次本来可以自愈的重渲染变成一次彻底失败的登录——
+    因为上层只对 stale 做重试。
+    """
+
+    class _El:
+        def clear(self):
+            raise StaleElementReferenceException("stale")
+
+        def send_keys(self, value):
+            raise AssertionError("stale 之后不该再走到 send_keys")
+
+    with pytest.raises(StaleElementReferenceException):
+        browser_login._type_password(_El(), "pw")
+
+
+def test_press_enter_keeps_stale_retryable():
+    class _El:
+        def send_keys(self, keys):
+            raise StaleElementReferenceException("stale")
+
+    with pytest.raises(StaleElementReferenceException):
+        browser_login._press_enter(_El())
+
+
+def test_fill_keeps_stale_retryable():
+    class _El:
+        def clear(self):
+            raise StaleElementReferenceException("stale")
+
+        def send_keys(self, value):
+            raise AssertionError("stale 之后不该再走到 send_keys")
+
+    with pytest.raises(StaleElementReferenceException):
+        browser_login._fill(_El(), "value")
+
+
+def test_solving_a_captcha_keeps_stale_retryable():
+    """截图时图片失效也要重来一轮，不能当成"识别失败"——那会让 decide_submit
+    跳过提交，等于白费一轮（而这一轮本来什么都没提交）。"""
+
+    class _El:
+        @property
+        def screenshot_as_png(self):
+            raise StaleElementReferenceException("stale")
+
+    with pytest.raises(StaleElementReferenceException):
+        browser_login._solve_captcha(_El())
+
+
+def test_submit_keeps_stale_retryable_and_does_not_fall_back_to_enter():
+    """点提交时 stale 等价于"根本没提交"。
+
+    WebDriver 会先解析元素引用，引用失效就直接报 stale、不派发点击。所以这时
+    可以放心重来一轮；但**绝不能**在这里退化成回车——那有可能变成第二次提交。
+    """
+
+    class _El:
+        def __init__(self):
+            self.entered = False
+
+        def click(self):
+            raise StaleElementReferenceException("stale")
+
+        def send_keys(self, keys):
+            self.entered = True
+
+    submit_el, password_el = _El(), _El()
+    fields = SimpleNamespace(submit=submit_el, password=password_el)
+
+    with pytest.raises(StaleElementReferenceException):
+        browser_login._submit(_StubDriver(), fields)
+
+    assert password_el.entered is False
+
+
+def test_submit_falls_back_to_enter_for_a_non_stale_click_failure():
+    """非 stale 的点击失败（比如按钮被别的东西挡住）仍然退回回车。"""
+    from selenium.common.exceptions import ElementClickInterceptedException
+
+    class _El:
+        def __init__(self):
+            self.entered = False
+
+        def click(self):
+            raise ElementClickInterceptedException("intercepted")
+
+        def send_keys(self, keys):
+            self.entered = True
+
+    submit_el, password_el = _El(), _El()
+    fields = SimpleNamespace(submit=submit_el, password=password_el)
+
+    browser_login._submit(_StubDriver(), fields)
+
+    assert password_el.entered is True
+
+
+def test_attempt_gives_up_cleanly_when_the_page_never_stops_re_rendering(monkeypatch, caplog):
+    """页面一直重渲染时要干净地收场：给出可读的原因，而不是抛出去。
+
+    真机那种情况，用户看到的是 state.json 里一句 browser_error + 一条能看懂的
+    日志，而不是一个栈回溯。
+    """
+    monkeypatch.setattr(browser_login, "_SETTLE_STEP", 0)
+    monkeypatch.setattr(browser_login, "_STALE_RETRIES", 1)
+    driver = _StubDriver(found=browser_login._PageChanged("一直重渲染"))
+    cfg = SimpleNamespace(selectors={}, username="u", probe_timeout=1)
+
+    with caplog.at_level(logging.WARNING, logger="src.browser_login"):
+        result, image_el, reload_el = browser_login._attempt(driver, cfg, "pw", False, 1)
+
+    assert result.ok is False
+    assert result.reason == "browser_error"
+    assert "重渲染" in result.detail or "重渲染" in caplog.text
+    assert (image_el, reload_el) == (None, None)
+
+
+def test_stale_retry_does_not_consume_a_captcha_attempt(monkeypatch, caplog):
+    """重渲染的重试必须是"提交前重来"，不能占用 captcha_max_retry 的次数。
+
+    锁号预算就靠这个：重渲染什么都没提交，不该算一次尝试。
+    """
+    monkeypatch.setattr(browser_login, "_SETTLE_STEP", 0)
+    monkeypatch.setattr(browser_login, "_STALE_RETRIES", 2)
+    driver = _StubDriver(found=browser_login._PageChanged("一直重渲染"))
+    cfg = SimpleNamespace(selectors={}, username="u", probe_timeout=1)
+
+    with caplog.at_level(logging.WARNING, logger="src.browser_login"):
+        browser_login._attempt(driver, cfg, "pw", False, 1)
+
+    # 重试次数由 _STALE_RETRIES 决定（=2 表示最多 3 轮），与验证码次数无关
+    assert caplog.text.count("重新采集后再来一次") == 2
+    assert "不计入验证码重试次数" in caplog.text
+
+
+# --- 失败现场转储（密码绝不落盘）--------------------------------------------
+
+
+def test_scrub_removes_the_password_in_every_encoding():
+    source = ('<input type="password" value="p&amp;ss">'
+              '<script>var p = "p&ss";</script>'
+              '<a href="/x?p=p%26ss">next</a>')
+
+    scrubbed = browser_login._scrub(source, "p&ss")
+
+    assert "p&ss" not in scrubbed
+    assert "p&amp;ss" not in scrubbed
+    assert "p%26ss" not in scrubbed
+    assert browser_login._MASK in scrubbed
+    assert browser_login._contains_secret(scrubbed, "p&ss") is False
+
+
+def test_contains_secret_checks_all_the_forms():
+    assert browser_login._contains_secret('value="p&amp;ss"', "p&ss") is True
+    assert browser_login._contains_secret("nothing here", "p&ss") is False
+
+
+def test_dump_failure_clears_the_password_field_before_capturing(tmp_path):
+    """截图会把输入框里的值直接画出来（密码框通常画圆点，但这个不保证），
+    所以转储之前必须先把值清掉。"""
+    box = _StubElement("密码框")
+    driver = _StubDumpDriver(source="<html>ok</html>", password_fields=[box])
+    cfg = SimpleNamespace(base_dir=str(tmp_path))
+
+    browser_login._dump_failure(driver, cfg, "Sup3rSecret", "captcha_failed")
+
+    assert box.cleared is True
+
+
+def test_dump_failure_writes_source_and_screenshot_without_the_password(tmp_path):
+    source = ('<html><input type="password" value="Sup3rSecret">'
+              '<p>验证码错误，请重新输入</p></html>')
+    driver = _StubDumpDriver(source=source)
+    cfg = SimpleNamespace(base_dir=str(tmp_path))
+
+    note = browser_login._dump_failure(driver, cfg, "Sup3rSecret", "captcha_failed")
+
+    html_file = next(tmp_path.glob("failure-*.html"))
+    text = html_file.read_text(encoding="utf-8")
+
+    assert "Sup3rSecret" not in text                  # 密码绝不落盘
+    assert browser_login._MASK in text
+    assert "验证码错误，请重新输入" in text            # 有用的内容要留着
+    assert html_file.with_suffix(".png").exists()     # 截图也落盘了
+    assert str(html_file) in note
+
+
+def test_dump_failure_refuses_to_write_html_when_the_password_cannot_be_scrubbed(
+        tmp_path, monkeypatch):
+    """抹不干净就宁可不写这个文件：失败诊断绝不能变成密码泄露的口子。
+
+    这里把 _scrub 换成"什么都不抹"来模拟一个抹不掉的秘密（比如某种没预料到的
+    编码形式），断言 html 没有被写出去。
+    """
+    monkeypatch.setattr(browser_login, "_scrub", lambda text, secret: text)
+    driver = _StubDumpDriver(source='<input value="Sup3rSecret">')
+    cfg = SimpleNamespace(base_dir=str(tmp_path))
+
+    note = browser_login._dump_failure(driver, cfg, "Sup3rSecret", "captcha_failed")
+
+    assert list(tmp_path.glob("failure-*.html")) == []      # html 宁可不写
+    assert len(list(tmp_path.glob("failure-*.png"))) == 1   # 截图仍保存（值已清空）
+    assert "未保存" in note
+
+
+def test_dump_failure_survives_a_driver_that_cannot_read_anything(tmp_path):
+    """转储本身是最后一道诊断手段，它自己出问题也不能把登录流程弄崩。"""
+
+    class _BrokenDriver:
+        page_source = ""
+
+        def find_elements(self, by, value):
+            raise WebDriverException("no window")
+
+        def save_screenshot(self, path):
+            raise WebDriverException("no window")
+
+    cfg = SimpleNamespace(base_dir=str(tmp_path))
+
+    note = browser_login._dump_failure(_BrokenDriver(), cfg, "pw", "browser_error")
+
+    assert "失败现场" in note

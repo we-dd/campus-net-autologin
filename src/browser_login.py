@@ -22,15 +22,19 @@ URL 参数还是动态的），而是用 Selenium 驱动用户机器上装好的
 """
 from __future__ import annotations
 
+import html as html_module
 import logging
+import os
 import shutil
 import tempfile
 import time
-from dataclasses import dataclass
+import urllib.parse
+from dataclasses import dataclass, field
 
 from selenium import webdriver
 from selenium.common.exceptions import (
     NoSuchElementException,
+    StaleElementReferenceException,
     TimeoutException,
     WebDriverException,
 )
@@ -48,8 +52,30 @@ log = logging.getLogger(__name__)
 _POST_SUBMIT_WAIT = 2.0
 # 点完验证码图片（或刷新页面）后等新图加载出来的秒数。
 _REFRESH_WAIT = 0.5
-# 等登录表单出现时的轮询间隔（见 _wait_for_password_field）。
+# 等登录表单出现时的轮询间隔（见 _wait_until_ready）。
 _FORM_WAIT_STEP = 0.5
+
+# --- 页面稳定判定 -----------------------------------------------------------
+# "导航结束"不等于"SPA 渲染完了"。真实门户是 Angular，门户劫持之后还有
+# flowSessionId 的跳转链，跳完之后整个表单会重新渲染一次。实测（第一次真机运行）：
+# 导航后 0.5 秒去采集元素，采到一半页面重渲染，手里所有句柄一起失效，整轮以
+# stale element reference 崩掉。
+# 所以采集之前必须确认文档连续几次采样都没变化。
+_SETTLE_STEP = 0.5
+_SETTLE_SAMPLES = 3
+# 等页面稳定的总预算。刻意**不**复用 cfg.probe_timeout：那个是给 HTTP 探测用的
+# （默认 5 秒），而"门户劫持 + flowSessionId 跳转链 + Angular 启动"实测比它慢得多。
+# 只在"确实要登录"这条路上花这个时间，等到了就立刻继续。
+_SETTLE_TIMEOUT = 20.0
+
+# 一轮尝试里，因为页面重渲染而重来的次数上限。这类失败**没有提交任何东西**，
+# 所以既不计入 captcha_max_retry，也不消耗锁号预算。
+_STALE_RETRIES = 3
+
+# 失败现场转储的文件名前缀（配套的 .html / .png 在 .gitignore 里）
+_DUMP_PREFIX = "failure-"
+# 被抹掉的秘密用什么占位
+_MASK = "***已抹除***"
 
 # 表单元素的采集范围。一次 find_elements 用逗号选择器拿到的就是文档顺序，
 # 描述符里的 index 因此可以跨标签比较大小——"离验证码图片最近"这类判断靠它。
@@ -75,6 +101,24 @@ class Result:
     ok: bool
     reason: str
     detail: str = ""
+
+
+class _ElementGone(StaleElementReferenceException):
+    """元素在采集过程中失效了。
+
+    故意继承 StaleElementReferenceException：它本来就是"stale"这一类，只是带上
+    了"是在采集属性的时候没的"这个上下文。这样所有 `except WebDriverException`
+    的兜底照样接得住，上层的 stale 重试也认它。
+    """
+
+
+class _PageChanged(Exception):
+    """页面在我们操作的过程中重渲染了，手里的句柄全部作废。
+
+    单独一个异常类型，是为了让上层区分"重来一轮就好"和"这次真的失败了"：
+    这类失败**什么都没提交**，所以既不该计入 captcha_max_retry，也不该消耗
+    锁号预算。它只在"提交之前"那一段里出现——提交之后一律不许重来。
+    """
 
 
 class _PasswordSendError(Exception):
@@ -550,9 +594,16 @@ def render_overrides(driver, selectors: dict) -> str:
 
 
 def _attr(el, name: str) -> str:
-    """读属性。读不到返回空串：元素在采集过程中失效时不该炸掉整轮尝试。"""
+    """读属性。读不到返回空串。
+
+    但 stale 要单独抛出去（_ElementGone）：那说明页面重渲染了，这个元素已经不在
+    文档里。继续按空串读下去会采出一堆"属性全空"的假描述符，然后被误判成
+    "这页不是登录页"——实测第一次真机运行就是这么崩的，错误结论比崩溃更难查。
+    """
     try:
         return el.get_attribute(name) or ""
+    except StaleElementReferenceException as e:
+        raise _ElementGone(f"读取属性 {name}: {e}") from None
     except WebDriverException as e:
         log.debug("读取属性 %s 失败: %s", name, e)
         return ""
@@ -561,6 +612,8 @@ def _attr(el, name: str) -> str:
 def _visible(el) -> bool:
     try:
         return bool(el.is_displayed())
+    except StaleElementReferenceException as e:
+        raise _ElementGone(f"读取可见性: {e}") from None
     except WebDriverException:
         return False
 
@@ -569,10 +622,12 @@ def _text(el) -> str:
     """读可见文字。
 
     对不可见的元素 .text 会走一次 JS 往返，个别情况下还会抛，所以必须兜住——
-    采集一个元素失败不该让整轮尝试崩掉。
+    采集一个元素失败不该让整轮尝试崩掉。stale 同样单独抛（见 _attr）。
     """
     try:
         return (el.text or "").strip()
+    except StaleElementReferenceException as e:
+        raise _ElementGone(f"读取文字: {e}") from None
     except WebDriverException as e:
         log.debug("读取元素文字失败: %s", e)
         return ""
@@ -590,6 +645,8 @@ def _nearby_text(el) -> str:
         try:
             node = node.find_element(By.XPATH, "..")
             text = (node.text or "").strip()
+        except StaleElementReferenceException as e:
+            raise _ElementGone(f"读取附近文字: {e}") from None
         except WebDriverException as e:
             log.debug("读取元素附近文字失败: %s", e)
             return ""
@@ -603,30 +660,39 @@ def _describe(el) -> dict:
 
     index 先给 -1，由 _collect 按文档顺序覆盖。单独列出来是因为描述符要能脱离
     浏览器构造——测试里的页面就是这么手搓出来的。
+
+    采集途中元素失效就返回 {"stale": True}，由 _collect 统一转成 _PageChanged。
+    这里不直接抛，是因为 _collect 只需要知道"有元素失效了"这一件事。
     """
     try:
-        size = el.size or {}
-    except WebDriverException:
-        size = {}
+        try:
+            size = el.size or {}
+        except StaleElementReferenceException as e:
+            raise _ElementGone(f"读取尺寸: {e}") from None
+        except WebDriverException:
+            size = {}
 
-    kind = _attr(el, "type").strip().lower()
+        kind = _attr(el, "type").strip().lower()
 
-    return {
-        "index": -1,
-        "tag": (el.tag_name or "").lower(),
-        "type": kind,
-        "id": _attr(el, "id"),
-        "name": _attr(el, "name"),
-        "class": _attr(el, "class"),
-        "placeholder": _attr(el, "placeholder"),
-        "value": _attr(el, "value"),
-        "src": _attr(el, "src"),
-        "text": _text(el),
-        # 只有复选框需要：它的文字在旁边的节点里，其它元素用不上，省掉往返
-        "nearby": _nearby_text(el) if kind == "checkbox" else "",
-        "visible": _visible(el),
-        "size": (int(size.get("width") or 0), int(size.get("height") or 0)),
-    }
+        return {
+            "index": -1,
+            "tag": (el.tag_name or "").lower(),
+            "type": kind,
+            "id": _attr(el, "id"),
+            "name": _attr(el, "name"),
+            "class": _attr(el, "class"),
+            "placeholder": _attr(el, "placeholder"),
+            "value": _attr(el, "value"),
+            "src": _attr(el, "src"),
+            "text": _text(el),
+            # 只有复选框需要：它的文字在旁边的节点里，其它元素用不上，省掉往返
+            "nearby": _nearby_text(el) if kind == "checkbox" else "",
+            "visible": _visible(el),
+            "size": (int(size.get("width") or 0), int(size.get("height") or 0)),
+        }
+    except _ElementGone as e:
+        log.debug("采集元素时页面重渲染: %s", e)
+        return {"index": -1, "stale": True}
 
 
 def _collect(driver) -> tuple[list, list[dict]]:
@@ -634,6 +700,10 @@ def _collect(driver) -> tuple[list, list[dict]]:
 
     一次 find_elements 用逗号选择器拿到的就是文档顺序，所以描述符里的 index 同时
     也是 elements 里的下标，"离谁最近"这类判断可以直接跨标签比。
+
+    采集中途发现任何元素失效（页面重渲染）就抛 _PageChanged：这时的 descriptors
+    是残缺的（失效的那些属性全空），拿它去判断"这是不是登录页"会得出错误结论。
+    实测第一次真机运行就是这么崩的——错误结论比崩溃更难查，所以宁可重来一轮。
     """
     elements = driver.find_elements(By.CSS_SELECTOR, _FORM_SELECTOR)
     descriptors = []
@@ -641,6 +711,10 @@ def _collect(driver) -> tuple[list, list[dict]]:
         desc = _describe(el)
         desc["index"] = index
         descriptors.append(desc)
+
+    if any(d.get("stale") for d in descriptors):
+        raise _PageChanged("采集元素的过程中页面重渲染，元素句柄失效")
+
     return elements, descriptors
 
 
@@ -765,37 +839,110 @@ def _password_visible(driver) -> bool:
     return False
 
 
-def _wait_for_password_field(driver, cfg: Config, deadline: float) -> None:
-    """等密码框出现，最多等到 deadline。
+def _ready_state(driver) -> str:
+    try:
+        return str(driver.execute_script("return document.readyState") or "")
+    except WebDriverException as e:
+        log.debug("读取 document.readyState 失败: %s", e)
+        return ""
 
-    这条等待是给门户劫持那条路准备的：driver.get() 在劫持场景下经常超时返回
-    （门户把连接挂着不返回，见 _navigate），而那一刻页面很可能还在渲染——重定向链
-    还没走完。只采一次的话，会把"还没画出来"错判成"不是登录页"，然后放弃整轮，
-    而这一轮本来是可以成功的。
 
-    用一条便宜的查询轮询，而不是反复 _collect()：_collect 会把每个
-    input/button/a/img 的属性都读一遍（几十次 WebDriver 往返），半秒轮询一次
-    太浪费。
+def _wait_for_settle(driver, deadline: float, budget: float) -> bool:
+    """等页面自己稳定下来，最多等到 deadline。
 
-    用户如果指定了 password 选择器就跳过等待——他既然知道页面长什么样，
-    就按他给的来，不必猜。
+    "导航结束"不等于"SPA 渲染完了"：真实门户是 Angular，门户劫持之后还有
+    flowSessionId 的跳转链，跳完之后整个表单还会重新渲染一次。实测第一次真机运行
+    就是在导航后 0.5 秒去采集元素，采到一半页面重渲染，手里所有句柄一起失效。
+
+    判据：document.readyState 是 complete，且 location.href 连续 _SETTLE_SAMPLES
+    次采样都没变。等不到就打一条明确的日志往下走——不抛异常，让调用方按当前
+    状态判定，并且日志里要能看出"是没等到稳定"而不是别的。
+
+    返回是否等到了稳定。
     """
+    stable = 0
+    last_url = None
+    while True:
+        state = _ready_state(driver)
+        url = _current_url(driver)
+
+        if state == "complete" and url and url == last_url:
+            stable += 1
+            if stable >= _SETTLE_SAMPLES:
+                log.debug("页面已稳定: %s", url)
+                return True
+        else:
+            stable = 0
+        last_url = url
+
+        if time.monotonic() >= deadline:
+            log.warning(
+                "等待页面稳定超时（预算 %.0f 秒）：地址 %s，readyState=%s。"
+                "按当前状态继续，但页面可能还在渲染，这一步失败多半是它导致的",
+                budget, url or "(读不到)", state or "(读不到)",
+            )
+            return False
+        time.sleep(_SETTLE_STEP)
+
+
+def _wait_until_ready(driver, cfg: Config, deadline: float, budget: float) -> None:
+    """正式动手之前的等待：页面稳定，且登录表单已经在上面。
+
+    两件事都做完才继续：
+      1. 等文档稳定（见 _wait_for_settle）——这一步是修"采集中途页面重渲染"的关键；
+      2. 等可见的密码框出现在页面上。
+    用户如果指定了 password 选择器，第 2 步跳过（他既然知道页面长什么样，就按他
+    给的来），但第 1 步**仍然要做**：页面没稳定跟有没有选择器无关。
+    """
+    _wait_for_settle(driver, deadline, budget)
+
     if cfg.selectors.get("password"):
         return
 
-    while True:
-        if _password_visible(driver):
-            return
+    while not _password_visible(driver):
         if time.monotonic() >= deadline:
-            log.debug("等待密码框超时，按当前页面状态继续")
+            log.warning("等不到登录表单（可见的密码框），按当前页面状态继续")
             return
         time.sleep(_FORM_WAIT_STEP)
 
 
+def _still_attached(driver, el) -> bool:
+    """元素是否还挂在当前文档上。
+
+    一次 JS 调用就能精准判断：重渲染之后旧节点被摘掉，document.contains 为 false。
+    比重新采集一遍便宜得多（一次往返 vs 几十次）。
+
+    传进去的句柄如果已经 stale，Selenium 序列化它的时候就会抛
+    StaleElementReferenceException —— 那也正是"不可用"，所以一并算 False。
+    """
+    try:
+        return bool(driver.execute_script(
+            "return !!(arguments[0] && document.contains(arguments[0]))", el))
+    except WebDriverException as e:
+        log.debug("元素已失效（%s）", type(e).__name__)
+        return False
+
+
+def _require_alive(driver, el, what: str) -> None:
+    """动手之前确认句柄还活着；死了就抛 _PageChanged 让上层整轮重来。
+
+    el 为 None（这个字段本页没有）时什么都不做。
+    """
+    if el is None:
+        return
+    if not _still_attached(driver, el):
+        raise _PageChanged(f"{what} 的元素在操作前已失效")
+
+
 def _fill(el, value: str) -> None:
-    """清空并填入。clear() 失败不算致命，退回直接输入。"""
+    """清空并填入。clear() 失败不算致命，退回直接输入。
+
+    但 stale 要往外抛：那说明页面重渲染了，这个句柄已经作废，整轮得重来。
+    """
     try:
         el.clear()
+    except StaleElementReferenceException:
+        raise
     except WebDriverException as e:
         log.debug("清空输入框失败，直接输入: %s", e)
     el.send_keys(value)
@@ -812,6 +959,11 @@ def _type_password(el, value: str) -> None:
     try:
         el.clear()
         el.send_keys(value)
+    except StaleElementReferenceException:
+        # 必须原样往外抛，不能包成 _PasswordSendError：stale 是"页面重渲染了，
+        # 整轮重来就好"，而 _PasswordSendError 是"密码输入失败，这次就这样了"，
+        # 两者的处理完全不同。包错了会让一次可以自愈的重渲染变成一次失败的登录。
+        raise
     except WebDriverException as e:
         raise _PasswordSendError(type(e).__name__) from None
 
@@ -824,14 +976,24 @@ def _press_enter(el) -> None:
     """
     try:
         el.send_keys(Keys.ENTER)
+    except StaleElementReferenceException:
+        raise  # 同上：stale 要让上层重来一轮
     except WebDriverException as e:
         raise _PasswordSendError(type(e).__name__) from None
 
 
 def _snapshot(driver) -> dict:
-    """采集判定用的页面状态。每一步失败都只影响对应的字段，不整体失败。"""
+    """采集判定用的页面状态。每一步失败都只影响对应的字段，不整体失败。
+
+    这里**绝不能**把 _PageChanged 抛出去：这个函数在提交之后才调用，一抛出去
+    上层就会以为"可以重来一轮"，而重来意味着再提交一次——那就重复打认证服务器了。
+    所以页面重渲染时按"采不到"处理，让判定给出最保守的结论。
+    """
     try:
         _elements, descriptors = _collect(driver)
+    except _PageChanged as e:
+        log.debug("判定前采集元素失败（页面重渲染）: %s", e)
+        descriptors = []
     except WebDriverException as e:
         log.debug("采集页面元素失败: %s", e)
         descriptors = []
@@ -912,90 +1074,203 @@ def _resolve(driver, elements, override: str, desc: dict | None, kind: str):
     return elements[desc["index"]]
 
 
-def _attempt(driver, cfg: Config, password: str, nav_timed_out: bool, attempt: int):
-    """做一次完整的登录尝试。
+@dataclass
+class _Fields:
+    """一次尝试用到的元素句柄，全部取自**同一次**采集。
 
-    返回 (Result, 验证码图片元素, 验证码刷新元素)，后两个供下一轮刷新验证码用。
+    这些句柄随时可能因为页面重渲染而失效（真实门户是 Angular，会在我们操作的过程
+    中重新渲染整页），所以每次动手之前都要 _require_alive 验一下；一旦失效就整轮
+    重来，绝不复用（见 _attempt 的提交前重试）。
     """
-    # 先等表单画出来再采（见 _wait_for_password_field）。表单已经在页面上时这一步
-    # 只花一次查询的代价。
-    _wait_for_password_field(driver, cfg, time.monotonic() + cfg.probe_timeout)
 
+    page: Page | None = None
+    controls: list = field(default_factory=list)
+    images: list = field(default_factory=list)
+    username: object = None
+    password: object = None
+    captcha_image: object = None
+    captcha_input: object = None
+    captcha_reload: object = None
+    agree: object = None
+    submit: object = None
+
+
+def _gather(driver, cfg: Config) -> _Fields:
+    """采集一遍页面，决定每个字段是谁，并把句柄取出来。"""
     elements, descriptors = _collect(driver)
     controls = [d for d in descriptors if d["tag"] != "img"]
     images = [d for d in descriptors if d["tag"] == "img"]
+
+    # 页面解析交给纯函数层，这里只负责把结论映射回 WebElement。
+    page = locate(controls, images)
     selectors = cfg.selectors
 
-    # 页面解析交给纯函数（纯函数层），这里只负责把结论映射回 WebElement。
-    page = locate(controls, images)
+    return _Fields(
+        page=page, controls=controls, images=images,
+        username=_resolve(driver, elements, selectors.get("username", ""),
+                          page.username, "username"),
+        password=_resolve(driver, elements, selectors.get("password", ""),
+                          page.password, "password"),
+        captcha_image=_resolve(driver, elements, selectors.get("captcha_image", ""),
+                               page.captcha_image, "captcha_image"),
+        captcha_input=_resolve(driver, elements, selectors.get("captcha_input", ""),
+                               page.captcha_input, "captcha_input"),
+        captcha_reload=_resolve(driver, elements, selectors.get("captcha_reload", ""),
+                                page.captcha_reload, "captcha_reload"),
+        agree=_resolve(driver, elements, selectors.get("agree", ""),
+                       page.agree, "agree"),
+        submit=_resolve(driver, elements, selectors.get("submit", ""),
+                        page.submit, "submit"),
+    )
 
-    username_el = _resolve(driver, elements,
-                           selectors.get("username", ""), page.username, "username")
-    password_el = _resolve(driver, elements,
-                           selectors.get("password", ""), page.password, "password")
 
-    if username_el is None or password_el is None:
-        detail = _missing_detail(controls, images,
-                                 username_el is not None, password_el is not None)
+@dataclass
+class _Outcome:
+    """可重来段（提交之前）的结果。
+
+    give_up 非空表示这一轮不用提交了（不是登录页 / 超时 / 验证码没认出来），
+    直接把它当结果返回；fields 仍然带上，好让下一轮能刷新验证码。
+    """
+
+    give_up: Result | None = None
+    fields: _Fields | None = None
+    captcha_text: str = ""
+
+
+def _submit(driver, f: _Fields) -> None:
+    """点提交（找不到按钮就用回车兜底）。
+
+    这一步抛 stale 是**安全**的：WebDriver 会先解析元素引用，引用失效就直接报
+    stale、根本不派发点击。所以"抛了 stale"等价于"没有提交过"，上层可以放心重来。
+
+    反过来，只要这个函数正常返回，就说明提交已经发出去了——调用方必须立刻进入
+    "不许重来"的阶段（见 _attempt）。
+    """
+    if f.submit is None:
+        log.info("没找到提交按钮，改用回车提交")
+        _require_alive(driver, f.password, "密码输入框")
+        _press_enter(f.password)
+        return
+
+    _require_alive(driver, f.submit, "提交按钮")
+    try:
+        f.submit.click()
+    except StaleElementReferenceException:
+        raise
+    except WebDriverException as e:
+        log.warning("点击提交按钮失败（%s），改用回车提交", type(e).__name__)
+        _require_alive(driver, f.password, "密码输入框")
+        _press_enter(f.password)
+
+
+def _prepare(driver, cfg: Config, password: str, nav_timed_out: bool,
+             attempt: int) -> _Outcome:
+    """可重来段：等页面就绪 → 采集 → 定位 → 填表 → 勾选 → 提交。
+
+    这一段里遇到 stale 是安全的：什么都没有提交，重来一轮不会重复打认证服务器，
+    也不消耗 captcha_max_retry。
+    """
+    _wait_until_ready(driver, cfg, time.monotonic() + _SETTLE_TIMEOUT, _SETTLE_TIMEOUT)
+
+    f = _gather(driver, cfg)
+
+    if f.username is None or f.password is None:
+        detail = _missing_detail(f.controls, f.images,
+                                 f.username is not None, f.password is not None)
         # 表单没找到：如果这次导航本来就超时了，那更该按超时报告——
         # 否则用户会去查"是不是登录页变了"，而真正的原因只是页面没加载完。
         reason = "timeout" if nav_timed_out else "not_login_page"
         log.error("第 %d 次尝试放弃: %s", attempt, detail)
-        return Result(False, reason, detail), None, None
+        return _Outcome(give_up=Result(False, reason, detail))
 
     # 剩下唯一一种 page.reason 是"验证码只找到一半"。用户把验证码的两个选择器都
     # 配好了就不适用这条——他的选择器会覆盖启发式，这时按配置继续。
-    if page.reason and not (selectors.get("captcha_image") and selectors.get("captcha_input")):
-        log.error("第 %d 次尝试放弃: %s", attempt, page.detail)
-        return Result(False, page.reason, page.detail), None, None
-
-    image_el = _resolve(driver, elements, selectors.get("captcha_image", ""),
-                        page.captcha_image, "captcha_image")
-    captcha_el = _resolve(driver, elements, selectors.get("captcha_input", ""),
-                          page.captcha_input, "captcha_input")
-    reload_el = _resolve(driver, elements, selectors.get("captcha_reload", ""),
-                         page.captcha_reload, "captcha_reload")
-    agree_el = _resolve(driver, elements, selectors.get("agree", ""),
-                        page.agree, "agree")
-    submit_el = _resolve(driver, elements, selectors.get("submit", ""),
-                         page.submit, "submit")
+    if f.page.reason and not (cfg.selectors.get("captcha_image")
+                              and cfg.selectors.get("captcha_input")):
+        log.error("第 %d 次尝试放弃: %s", attempt, f.page.detail)
+        return _Outcome(give_up=Result(False, f.page.reason, f.page.detail), fields=f)
 
     # 验证码必须在填密码之前抓：有些门户一输入密码就把验证码刷新掉。
     captcha_text = ""
-    if image_el is not None:
-        captcha_text = _solve_captcha(image_el)
+    if f.captcha_image is not None:
+        _require_alive(driver, f.captcha_image, "验证码图片")
+        captcha_text = _solve_captcha(f.captcha_image)
 
-    ok_to_submit, why_not = decide_submit(captcha_el is not None, captcha_text)
+    ok_to_submit, why_not = decide_submit(f.captcha_input is not None, captcha_text)
     if not ok_to_submit:
         log.warning("第 %d 次尝试：%s", attempt, why_not)
-        return Result(False, "captcha_failed", why_not), image_el, reload_el
+        return _Outcome(give_up=Result(False, "captcha_failed", why_not),
+                        fields=f, captcha_text=captcha_text)
 
-    _fill(username_el, cfg.username)
-    _type_password(password_el, password)  # 注意：绝不记录 password 的值
-    if captcha_el is not None:
-        _fill(captcha_el, captcha_text)
+    # 每个动作之前都重新确认句柄还活着：页面一旦重渲染就立刻整轮重来，绝不复用。
+    _require_alive(driver, f.username, "账号输入框")
+    _fill(f.username, cfg.username)
+    _require_alive(driver, f.password, "密码输入框")
+    _type_password(f.password, password)  # 注意：绝不记录 password 的值
+    if f.captcha_input is not None:
+        _require_alive(driver, f.captcha_input, "验证码输入框")
+        _fill(f.captcha_input, captcha_text)
+
     # 勾选放在填完之后、提交之前：这是真实登录的动作顺序，也避免勾选触发的
     # 重渲染把已经填好的内容弄乱。
-    _tick_agree(driver, agree_el)
+    _require_alive(driver, f.agree, "同意协议勾选框")
+    _tick_agree(driver, f.agree)
 
-    if submit_el is None:
-        log.info("没找到提交按钮，改用回车提交")
-        _press_enter(password_el)
-    else:
+    _submit(driver, f)
+    return _Outcome(fields=f, captcha_text=captcha_text)
+
+
+def _attempt(driver, cfg: Config, password: str, nav_timed_out: bool, attempt: int):
+    """做一次完整的登录尝试。
+
+    返回 (Result, 验证码图片元素, 验证码刷新元素)，后两个供下一轮刷新验证码用。
+
+    中间有一条很关键的分界线——**提交**：
+      - 提交之前：页面重渲染可以把整段重来。什么都没提交，重来不会重复打认证
+        服务器，也不消耗 captcha_max_retry（见 _STALE_RETRIES）。
+      - 提交之后：绝不重来。已经点过提交了，再重来就是往认证服务器多发一次请求，
+        既可能重复计数，也在消耗锁号预算。所以提交之后的判定遇到 stale 只按
+        "这次没成功"处理（见 _snapshot），并且这一轮照常计入验证码次数。
+    """
+    last = Result(False, "browser_error", "页面在提交前反复重渲染")
+
+    for round_no in range(1, _STALE_RETRIES + 2):
         try:
-            submit_el.click()
-        except WebDriverException as e:
-            log.warning("点击提交按钮失败（%s），改用回车提交", type(e).__name__)
-            _press_enter(password_el)
+            outcome = _prepare(driver, cfg, password, nav_timed_out, attempt)
+        except (_PageChanged, StaleElementReferenceException) as e:
+            last = Result(False, "browser_error",
+                          f"页面在登录过程中重渲染: {type(e).__name__}")
+            if round_no > _STALE_RETRIES:
+                # 最后一轮不再说"再来一次"——它会让人以为还有下一轮
+                log.error("第 %d 次尝试第 %d 轮：页面仍停在提交前重渲染（%s），不再重试",
+                          attempt, round_no, type(e).__name__)
+            else:
+                log.warning(
+                    "第 %d 次尝试第 %d 轮：页面在提交前重渲染（%s），重新采集后再来一次"
+                    "（没有提交任何东西，不计入验证码重试次数）",
+                    attempt, round_no, type(e).__name__,
+                )
+            time.sleep(_SETTLE_STEP)  # 给重渲染一点时间
+            continue
 
+        if outcome.give_up is not None:
+            f = outcome.fields or _Fields()
+            return outcome.give_up, f.captcha_image, f.captcha_reload
+        break
+    else:
+        log.error("第 %d 次尝试：连续 %d 轮都在提交前遇到页面重渲染，放弃本轮",
+                  attempt, _STALE_RETRIES + 1)
+        return last, None, None
+
+    # ---- 提交已经发出，以下绝不允许重来 ----
+    f = outcome.fields or _Fields()
     time.sleep(_POST_SUBMIT_WAIT)
-    snapshot = _snapshot(driver)
-    ok, reason, detail = judge(snapshot)
+    ok, reason, detail = judge(_snapshot(driver))
     if ok:
-        return Result(True, reason, detail), image_el, reload_el
+        return Result(True, reason, detail), f.captcha_image, f.captcha_reload
 
     log.warning("第 %d 次尝试未成功: %s", attempt, detail)
-    return Result(False, reason, detail), image_el, reload_el
+    return Result(False, reason, detail), f.captcha_image, f.captcha_reload
 
 
 def _js_click(driver, el) -> bool:
@@ -1092,6 +1367,10 @@ def _solve_captcha(image_el) -> str:
     """
     try:
         png = image_el.screenshot_as_png
+    except StaleElementReferenceException:
+        # 页面重渲染把图片换掉了。往外抛让上层整轮重来，而不是当成"识别失败"：
+        # 识别失败会让 decide_submit 跳过提交，等于白费一轮，而这次本来没提交过。
+        raise
     except WebDriverException as e:
         log.warning("验证码截图失败: %s", e)
         return ""
@@ -1146,13 +1425,130 @@ def _attempt_loop(driver, cfg: Config, password: str, nav_timed_out: bool) -> Re
     return last
 
 
+# ---------------------------------------------------------------------------
+# 失败现场转储
+#
+# 真机出一次问题，来回一轮的成本很高。把页面源码和整页截图落盘，用户只要把文件
+# 发过来就能定位。唯一硬约束是：密码绝不能进这两个文件。
+# ---------------------------------------------------------------------------
+
+# 密码短于这个长度时，抹除会连带抹掉大量无关内容，日志里提醒一句
+_SHORT_SECRET_WARN = 4
+
+
+def _secret_forms(secret: str) -> list[str]:
+    """同一个秘密在页面源码里可能出现的几种写法。"""
+    if not secret:
+        return []
+    forms = []
+    for form in (secret, html_module.escape(secret), urllib.parse.quote(secret)):
+        if form and form not in forms:
+            forms.append(form)
+    return forms
+
+
+def _scrub(text: str, secret: str) -> str:
+    """把秘密从文本里抹掉。
+
+    页面源码里本来不该有密码：我们输入进去的是 DOM 的 value 属性，而 outerHTML
+    序列化出来的是 value 特性（默认值）。但 Angular 之类的框架完全可能把值回写进
+    特性里，所以既然我们知道确切的那个字符串，就直接替换掉；HTML 转义和 URL
+    编码两种写法一并替换，免得绕过去。
+    """
+    for form in _secret_forms(secret):
+        text = text.replace(form, _MASK)
+    return text
+
+
+def _contains_secret(text: str, secret: str) -> bool:
+    return any(form in text for form in _secret_forms(secret))
+
+
+def _clear_password_field(driver, cfg: Config) -> None:
+    """尽力把密码框的值清掉。
+
+    转储里不能带密码：源码里虽然序列化的是特性而不是当前值，但截图会把值直接画
+    出来（密码框通常画成圆点，可这个不保证），所以先把值清掉最省事。
+    清不掉也不影响流程——后面还有"抹字符串"和"抹不干净就不写"两道保险。
+    """
+    try:
+        for el in driver.find_elements(By.CSS_SELECTOR, "input[type=password]"):
+            try:
+                el.clear()
+            except WebDriverException as e:
+                log.debug("清空密码框失败: %s", e)
+    except WebDriverException as e:
+        log.debug("查找密码框失败: %s", e)
+
+
+def _dump_failure(driver, cfg: Config, password: str, reason: str) -> str:
+    """把失败现场（页面源码 + 整页截图）落盘，返回一句写进日志和 state 的说明。
+
+    密码的三重保险：
+      1. 先把密码框清空——截图和源码里都没有那个值了；
+      2. 再把密码的几种写法从源码里替换掉；
+      3. 替换后仍能查到就**不写**这个文件。失败诊断绝不能变成泄露的口子，
+         宁可少一个文件。
+    """
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    base = os.path.join(cfg.base_dir or ".", f"{_DUMP_PREFIX}{stamp}")
+    html_path = base + ".html"
+    png_path = base + ".png"
+    notes = []
+
+    _clear_password_field(driver, cfg)
+
+    try:
+        source = driver.page_source or ""
+    except WebDriverException as e:
+        log.warning("读取页面源码失败，跳过 html 转储: %s", e)
+        source = ""
+
+    if not source:
+        notes.append("页面源码没读到")
+    else:
+        if password and len(password) < _SHORT_SECRET_WARN:
+            log.warning("密码很短，抹除会连带抹掉转储里很多无关字符，可读性会变差")
+        scrubbed = _scrub(source, password)
+        if _contains_secret(scrubbed, password):
+            log.error("页面源码里仍能查到密码，出于安全考虑不写 %s", html_path)
+            notes.append("页面源码疑似含密码，为安全起见未保存")
+        else:
+            try:
+                with open(html_path, "w", encoding="utf-8") as f:
+                    f.write(scrubbed)
+                notes.append(html_path)
+            except OSError as e:
+                log.warning("写页面源码失败: %s", e)
+                notes.append(f"页面源码写盘失败（{e}）")
+
+    try:
+        if driver.save_screenshot(png_path):
+            notes.append(png_path)
+        else:
+            notes.append("整页截图失败")
+    except WebDriverException as e:
+        log.warning("截整页图失败: %s", e)
+        notes.append(f"整页截图失败（{type(e).__name__}）")
+
+    text = f"失败现场（{reason}）: " + "，".join(notes)
+    log.error("%s", text)
+    return text
+
+
 def _run(cfg: Config, password: str) -> Result:
     profile = tempfile.mkdtemp(prefix="campus-net-profile-")
     driver = None
     try:
         driver = _build_driver(cfg, profile)
         nav_timed_out = _navigate(driver, cfg)
-        return _attempt_loop(driver, cfg, password, nav_timed_out)
+        result = _attempt_loop(driver, cfg, password, nav_timed_out)
+        if not result.ok:
+            # 失败现场必须在关掉浏览器之前落盘——关掉就什么都没有了。
+            # 只在失败时落盘，成功的运行不该往用户目录里堆文件。
+            note = _dump_failure(driver, cfg, password, result.reason)
+            result = Result(result.ok, result.reason, f"{result.detail}；{note}")
+        return result
     finally:
         # 浏览器一定要关：留着它用户会看到一个莫名多出来的窗口，而且下次运行
         # 如果复用了同一个配置目录就会起不来。
@@ -1210,6 +1606,8 @@ def dump_form(cfg: Config) -> Result:
     try:
         driver = _build_driver(cfg, profile)
         nav_timed_out = _navigate(driver, cfg)
+        # 用户拿 --dump-form 校准选择器，采到半张还在渲染的页面等于白跑一趟。
+        _wait_for_settle(driver, time.monotonic() + _SETTLE_TIMEOUT, _SETTLE_TIMEOUT)
         _elements, descriptors = _collect(driver)
 
         controls = [d for d in descriptors if d["tag"] != "img"]
@@ -1236,6 +1634,12 @@ def dump_form(cfg: Config) -> Result:
         if nav_timed_out:
             parts += ["", "注意：这次页面加载超时了，采到的元素可能不完整。"]
         return Result(True, "success", "\n".join(parts))
+    except _PageChanged as e:
+        # 采集时页面正在重渲染：这次采到的清单是残缺的，直接说明白，别让用户
+        # 拿一张半截的元素清单去校准选择器。
+        log.error("采集页面元素时页面重渲染: %s", e)
+        return Result(False, "browser_error",
+                      f"页面在采集元素的过程中重渲染（{e}），请重跑一次 --dump-form")
     except WebDriverException as e:
         log.error("打开登录页失败: %s", e)
         return Result(False, "browser_error", f"{type(e).__name__}: {e}")
