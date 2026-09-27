@@ -10,3 +10,4 @@ failure-*.html
 failure-*.png
 login-test.txt
 config.json
+*.zip
