@@ -259,4 +259,112 @@ def test_known_keys_are_exactly_the_documented_options():
         "captcha_max_retry", "run_max_fail", "window_hours",
         "window_max_fail", "probe_timeout",
         "login_page_url", "login_submit_url", "captcha_url",
+        "browser", "headless", "login_url", "selectors",
     }
+
+
+# --- 以下为浏览器自动化（任务书变更）新增：browser / headless / login_url / selectors
+
+
+def test_browser_defaults_to_edge(tmp_path):
+    cfg = load(write(tmp_path, minimal()))
+    assert cfg.browser == "edge"
+    assert cfg.headless is False
+    assert cfg.login_url == ""
+    assert cfg.selectors == {}
+
+
+@pytest.mark.parametrize("name", ["edge", "chrome"])
+def test_browser_accepts_supported_values(tmp_path, name):
+    assert load(write(tmp_path, minimal(browser=name))).browser == name
+
+
+def test_browser_is_normalized_to_lowercase(tmp_path):
+    assert load(write(tmp_path, minimal(browser="  Chrome "))).browser == "chrome"
+
+
+@pytest.mark.parametrize("bad", ["firefox", "EDGE2", "msedge", ""])
+def test_unsupported_browser_raises(tmp_path, bad):
+    with pytest.raises(ConfigError, match="browser"):
+        load(write(tmp_path, minimal(browser=bad)))
+
+
+def test_headless_true_is_accepted(tmp_path):
+    """headless 是本项目第一个 bool 配置项。
+
+    现有的整数校验刻意拒绝 bool（bool 是 int 的子类），照抄那段逻辑会把
+    headless: true 一起拒掉——这个用例就是钉住这件事。
+    """
+    assert load(write(tmp_path, minimal(headless=True))).headless is True
+
+
+def test_headless_false_is_accepted(tmp_path):
+    assert load(write(tmp_path, minimal(headless=False))).headless is False
+
+
+@pytest.mark.parametrize("bad", ["yes", "no", "true", "false", "", 1, 0, None])
+def test_headless_must_be_a_real_bool(tmp_path, bad):
+    """字符串 "false" 是真值：如果按真值判断放过去，用户以为自己关掉了
+    headless，实际上浏览器仍然不显示，而且没有任何提示。所以必须报错。"""
+    with pytest.raises(ConfigError, match="headless"):
+        load(write(tmp_path, minimal(headless=bad)))
+
+
+def test_headless_string_error_tells_the_user_not_to_quote_it(tmp_path):
+    with pytest.raises(ConfigError, match="引号"):
+        load(write(tmp_path, minimal(headless="yes")))
+
+
+def test_login_url_accepts_http_url(tmp_path):
+    cfg = load(write(tmp_path, minimal(login_url="http://10.0.0.1/login")))
+    assert cfg.login_url == "http://10.0.0.1/login"
+
+
+def test_blank_login_url_means_discover_by_redirect(tmp_path):
+    """留空是合法配置，不是错误：那时 browser_login 会打开探测地址，
+    由门户把浏览器劫持到登录页去。"""
+    assert load(write(tmp_path, minimal(login_url="   "))).login_url == ""
+
+
+def test_login_url_requires_scheme(tmp_path):
+    with pytest.raises(ConfigError, match="login_url"):
+        load(write(tmp_path, minimal(login_url="10.0.0.1/login")))
+
+
+def test_login_url_error_does_not_mention_derivation(tmp_path):
+    """login_url 没有可推导的默认值，所以不能走 _OPTIONAL_URL_FIELDS：
+    那句"不写这一项就会自动推导"会把人带偏。"""
+    with pytest.raises(ConfigError, match="login_url") as e:
+        load(write(tmp_path, minimal(login_url="nope")))
+    assert "自动推导" not in str(e.value)
+
+
+def test_selectors_accepts_string_map(tmp_path):
+    cfg = load(write(tmp_path, minimal(selectors={"username": "#user", "submit": "#go"})))
+    assert cfg.selectors == {"username": "#user", "submit": "#go"}
+
+
+def test_selectors_values_are_stripped(tmp_path):
+    cfg = load(write(tmp_path, minimal(selectors={"username": "  #user  "})))
+    assert cfg.selectors == {"username": "#user"}
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "not-an-object",
+        ["#user"],
+        {"username": {"selector": "#user"}},   # 多包了一层对象，是很自然的误写
+        {"username": 5},
+        {"username": None},
+    ],
+)
+def test_bad_selectors_raise_readable_error(tmp_path, bad):
+    with pytest.raises(ConfigError, match="selectors"):
+        load(write(tmp_path, minimal(selectors=bad)))
+
+
+def test_selectors_object_is_not_shared_between_instances(tmp_path):
+    a = load(write(tmp_path, minimal()))
+    a.selectors["username"] = "#hacked"
+    assert load(write(tmp_path, minimal())).selectors == {}

@@ -1,8 +1,9 @@
 """配置加载与校验。
 
-设计要点：登录相关的三个端点 URL 全部可配置。
-因为抓包尚未取得，默认值按锐捷 ePortal 的标准接口填写；
-拿到抓包后若不符，改 config.json 即可，不需要动代码。
+设计要点：登录方式已经改成用浏览器自动化（src/browser_login.py），
+所以 browser / headless / login_url / selectors 是当前真正生效的几项。
+下面那三个 *_url 端点是复刻 HTTP 登录时代的遗留配置，浏览器方案不再读它们，
+留着只是为了不让老配置文件加载失败。
 
 另一个要点：配置是用户手工编辑的（非程序员），所以这里所有可预期的错误
 都必须变成 ConfigError + 中文说明，不能把 JSONDecodeError、UnicodeDecodeError、
@@ -36,6 +37,10 @@ _INT_FIELDS = ("captcha_max_retry", "run_max_fail", "window_hours",
                "window_max_fail", "probe_timeout")
 _OPTIONAL_URL_FIELDS = ("login_page_url", "login_submit_url", "captcha_url")
 
+# browser 只认这两个。写 chrome 是为了 Edge 出问题时能换个浏览器试，
+# 两者的启动参数和驱动由 selenium 分别处理。
+_BROWSERS = ("edge", "chrome")
+
 # 日志级别只认这五个。故意不用 logging.getLevelNamesMapping()：那张表里有 NOTSET
 # （值是 0），填了它 root logger 的级别就变成 0，DEBUG 及以下会全部涌进 1 MiB 的
 # 轮转日志；FATAL / WARN 这类别名也不放进来，用户没有理由手写它们。
@@ -67,6 +72,15 @@ class Config:
     login_page_url: str = ""
     login_submit_url: str = ""
     captcha_url: str = ""
+
+    # 浏览器自动化相关。headless 默认 False：这个工具的价值之一就是用户能亲眼
+    # 看到它在做什么，出问题时也能立刻发现。
+    browser: str = "edge"
+    headless: bool = False
+    # 留空表示不直接指定登录页，而是打开探测地址、让门户把浏览器劫持过去。
+    login_url: str = ""
+    # 元素定位的覆盖项：{"username": "#user", "captcha_image": "#validcodeImg", ...}
+    selectors: dict[str, str] = field(default_factory=dict)
 
     base_dir: str = "."
     secret_path: str = ""
@@ -105,6 +119,9 @@ def _bad_type(where: str, key: str, expected: str, value: Any) -> ConfigError:
             msg += "（数字不要加引号）"
         elif isinstance(value, float):
             msg += "（去掉小数点）"
+    elif expected == "布尔值" and isinstance(value, str):
+        # "yes"/"false" 都是真值字符串，用户很可能以为写了 false 就是关。
+        msg += "（布尔值不要加引号，写 true 或 false）"
     return ConfigError(msg)
 
 
@@ -187,6 +204,29 @@ def _validate_probe_urls(urls: list, where: str) -> list[dict[str, Any]]:
     return cleaned
 
 
+def _validate_selectors(selectors: Any, where: str) -> dict[str, str]:
+    """校验元素定位覆盖项。
+
+    值必须都是字符串。写成 {"username": {"selector": "#user"}} 是很自然的误写，
+    放过去只会变成 selenium 抛出的一句 "argument of type 'dict' is not iterable"，
+    用户看不懂，也不知道要去改哪一行。空的字符串值按"没写"处理（browser_login 里
+    用 `if override:` 判断），所以不报错。
+    """
+    # 这里的 label 不再带「字段」二字：_bad_type 会自己拼一个，
+    # 带上就会变成"字段 selectors 字段 username"这种叠字。
+    label = f"{where} 的 selectors"
+
+    if not isinstance(selectors, dict):
+        raise _bad_type(where, "selectors", "对象", selectors)
+
+    cleaned: dict[str, str] = {}
+    for key, value in selectors.items():
+        if not isinstance(value, str):
+            raise _bad_type(label, str(key), "字符串", value)
+        cleaned[str(key)] = value.strip()
+    return cleaned
+
+
 def _warn_unknown_keys(data: dict, where: str) -> None:
     """拼错的键只警告、不报错。
 
@@ -266,6 +306,33 @@ def load(path: str = "config.json") -> Config:
             kwargs[key] = _check_url(
                 where, key, _require_str(data, key, where), derivable=True
             )
+
+    if "browser" in data:
+        browser = _require_str(data, "browser", where).strip().lower()
+        if browser not in _BROWSERS:
+            raise ConfigError(
+                f"{where} 字段 browser 取值非法: {_show(data['browser'])}，"
+                f"只能是 {' / '.join(_BROWSERS)}"
+            )
+        kwargs["browser"] = browser
+
+    if "headless" in data:
+        # 这里必须用 isinstance 判，不能写真值判断：字符串 "yes"、"no"、"false"
+        # 全是真值，放过去会让 headless 悄悄变成开，脚本在计划任务里"跑得好好的"，
+        # 用户却看不到浏览器窗口，出了问题也无从下手。
+        if not isinstance(data["headless"], bool):
+            raise _bad_type(where, "headless", "布尔值", data["headless"])
+        kwargs["headless"] = data["headless"]
+
+    if "login_url" in data:
+        # 留空合法，表示"打开探测地址、让门户把浏览器劫持到登录页"，这是默认行为。
+        # 所以不能走 _OPTIONAL_URL_FIELDS：那里的报错会说"不写这一项就会自动推导"，
+        # 而 login_url 没有可推导的默认值，那句话会把人带偏。
+        login_url = _require_str(data, "login_url", where).strip()
+        kwargs["login_url"] = _check_url(where, "login_url", login_url) if login_url else ""
+
+    if "selectors" in data:
+        kwargs["selectors"] = _validate_selectors(data["selectors"], where)
 
     _warn_unknown_keys(data, where)
 
