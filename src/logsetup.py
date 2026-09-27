@@ -15,19 +15,23 @@ _configured: set[str] = set()
 
 
 def init(log_path: str, level: str = "INFO") -> None:
-    key = os.path.abspath(log_path)
+    real_path = os.path.abspath(log_path)
+    # 用 normcase 后的路径去重：Windows 上 a.log 和 A.LOG 是同一个文件，
+    # 只用 abspath 会得到两个 key、两个 handler，日志写两遍。
+    key = os.path.normcase(real_path)
+
     root = logging.getLogger()
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
 
     if key in _configured:
         return
 
-    os.makedirs(os.path.dirname(key) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(real_path) or ".", exist_ok=True)
 
     fmt = logging.Formatter(_FORMAT)
 
     fh = logging.handlers.RotatingFileHandler(
-        key, maxBytes=1024 * 1024, backupCount=1, encoding="utf-8"
+        real_path, maxBytes=1024 * 1024, backupCount=1, encoding="utf-8"
     )
     fh.setFormatter(fmt)
     root.addHandler(fh)

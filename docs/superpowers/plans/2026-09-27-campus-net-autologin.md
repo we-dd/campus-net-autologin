@@ -461,13 +461,15 @@ def test_init_does_not_duplicate_handlers(tmp_path):
     assert len(logging.getLogger().handlers) == n
 
 
-def test_init_appends_file_handler_only_once_per_path(tmp_path):
-    log_file = tmp_path / "b.log"
-    init(str(log_file), "DEBUG")
-    logging.getLogger("src.x").debug("second-run")
+def test_init_does_not_truncate_existing_log(tmp_path):
+    log_file = tmp_path / "c.log"
+    log_file.write_text("上一轮的记录\n", encoding="utf-8")
+    init(str(log_file), "INFO")
+    logging.getLogger("src.x").info("本轮")
     for h in logging.getLogger().handlers:
         h.flush()
-    assert "second-run" in log_file.read_text(encoding="utf-8")
+    content = log_file.read_text(encoding="utf-8")
+    assert "上一轮的记录" in content and "本轮" in content
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -500,19 +502,23 @@ _configured: set[str] = set()
 
 
 def init(log_path: str, level: str = "INFO") -> None:
-    key = os.path.abspath(log_path)
+    real_path = os.path.abspath(log_path)
+    # 用 normcase 后的路径去重：Windows 上 a.log 和 A.LOG 是同一个文件，
+    # 只用 abspath 会得到两个 key、两个 handler，日志写两遍。
+    key = os.path.normcase(real_path)
+
     root = logging.getLogger()
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
 
     if key in _configured:
         return
 
-    os.makedirs(os.path.dirname(key) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(real_path) or ".", exist_ok=True)
 
     fmt = logging.Formatter(_FORMAT)
 
     fh = logging.handlers.RotatingFileHandler(
-        key, maxBytes=1024 * 1024, backupCount=1, encoding="utf-8"
+        real_path, maxBytes=1024 * 1024, backupCount=1, encoding="utf-8"
     )
     fh.setFormatter(fmt)
     root.addHandler(fh)
@@ -553,6 +559,7 @@ Create: `tests/test_config.py`
 
 ```python
 import json
+import logging
 
 import pytest
 
@@ -646,6 +653,115 @@ def test_bad_json_raises_readable_error(tmp_path):
     p.write_text("{not json", encoding="utf-8")
     with pytest.raises(ConfigError, match="不是合法的 JSON"):
         load(str(p))
+
+
+# --- 以下为评审补丁新增：probe_urls 形状校验 --------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_entry",
+    [
+        "http://x/",                                                      # 整条不是对象
+        [5],                                                              # 整条不是对象
+        5,                                                                # 整条不是对象
+        {"expect_status": 204},                                           # 缺 url
+        {"url": "   "},                                                   # url 是空白串
+        {"url": "http://x/", "expect_text": "a", "expect_status": 204},   # 两者都给
+        {"url": "http://x/"},                                             # 两者都没给
+        {"url": "http://x/", "expect_status": "204"},                     # expect_status 类型不对
+        {"url": "http://x/", "expect_status": True},                      # bool 不是整数
+        {"url": "http://x/", "expect_text": 5},                           # expect_text 类型不对
+    ],
+)
+def test_probe_urls_entry_shape_raises(tmp_path, bad_entry):
+    with pytest.raises(ConfigError, match="probe_urls"):
+        load(write(tmp_path, minimal(probe_urls=[bad_entry])))
+
+
+def test_probe_urls_error_names_index(tmp_path):
+    good = {"url": "http://ok/", "expect_status": 204}
+    with pytest.raises(ConfigError, match=r"probe_urls\[2\]"):
+        load(write(tmp_path, minimal(probe_urls=[good, {"nope": 1}])))
+
+
+def test_probe_urls_missing_url_is_config_error_not_raw_exception(tmp_path):
+    """缺 url 过去能加载成功，会让探测全部静默失败、误判成未登录。"""
+    with pytest.raises(ConfigError, match="url"):
+        load(write(tmp_path, minimal(probe_urls=[{"expect_status": 204}])))
+
+
+def test_valid_probe_urls_are_kept(tmp_path):
+    urls = [{"url": "http://ok/", "expect_status": 204, "note": "自定义键保留"}]
+    cfg = load(write(tmp_path, minimal(probe_urls=urls)))
+    assert cfg.probe_urls[0]["expect_status"] == 204
+    assert cfg.probe_urls[0]["note"] == "自定义键保留"
+
+
+# --- 以下为评审补丁新增：文件编码 --------------------------------------------
+
+
+def test_non_utf8_file_raises_readable_error(tmp_path):
+    p = tmp_path / "gbk.json"
+    p.write_bytes(
+        json.dumps(minimal(username="张三"), ensure_ascii=False).encode("gbk")
+    )
+    with pytest.raises(ConfigError, match="不是 UTF-8 编码"):
+        load(str(p))
+
+
+def test_utf8_bom_file_loads(tmp_path):
+    p = tmp_path / "bom.json"
+    p.write_bytes(b"\xef\xbb\xbf" + json.dumps(minimal()).encode("utf-8"))
+    assert load(str(p)).username == "2021001"
+
+
+# --- 以下为评审补丁新增：数值与 URL 取值 -------------------------------------
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["captcha_max_retry", "run_max_fail", "window_hours",
+     "window_max_fail", "probe_timeout"],
+)
+def test_bool_for_int_field_raises(tmp_path, field):
+    with pytest.raises(ConfigError, match=field):
+        load(write(tmp_path, minimal(**{field: True})))
+
+
+def test_portal_is_stripped(tmp_path):
+    cfg = load(write(tmp_path, minimal(portal="  http://10.71.29.181  ")))
+    assert cfg.portal == "http://10.71.29.181"
+    assert cfg.login_page_url == "http://10.71.29.181/eportal/InterFace.do?method=pageInfo"
+
+
+@pytest.mark.parametrize(
+    "field", ["login_page_url", "login_submit_url", "captcha_url"]
+)
+def test_url_fields_require_scheme(tmp_path, field):
+    with pytest.raises(ConfigError, match=field):
+        load(write(tmp_path, minimal(**{field: "10.71.29.181/eportal"})))
+
+
+# --- 以下为评审补丁新增：log_level 与拼错的键 --------------------------------
+
+
+def test_invalid_log_level_raises(tmp_path):
+    with pytest.raises(ConfigError, match="log_level"):
+        load(write(tmp_path, minimal(log_level="VERBOSE")))
+
+
+def test_unknown_key_warns_with_suggestion(tmp_path, caplog):
+    with caplog.at_level(logging.WARNING, logger="src.config"):
+        cfg = load(write(tmp_path, minimal(captcha_max_retrys=7)))
+    assert cfg.captcha_max_retry == 5
+    assert "captcha_max_retrys" in caplog.text
+    assert "是不是想写 captcha_max_retry" in caplog.text
+
+
+def test_known_keys_do_not_warn(tmp_path, caplog):
+    with caplog.at_level(logging.WARNING, logger="src.config"):
+        load(write(tmp_path, minimal(log_level="DEBUG", probe_timeout=9)))
+    assert caplog.text == ""
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -666,9 +782,15 @@ Create: `src/config.py`
 设计要点：登录相关的三个端点 URL 全部可配置。
 因为抓包尚未取得，默认值按锐捷 ePortal 的标准接口填写；
 拿到抓包后若不符，改 config.json 即可，不需要动代码。
+
+另一个要点：配置是用户手工编辑的（非程序员），所以这里所有可预期的错误
+都必须变成 ConfigError + 中文说明，不能把 JSONDecodeError、UnicodeDecodeError、
+ValueError 之类的原始异常抛到上层——上层只认 ConfigError，抛别的会变成
+退出码 1 的崩溃堆栈，而不是该有的配置错误提示。
 """
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import os
@@ -685,10 +807,24 @@ DEFAULT_PROBE_URLS: list[dict[str, Any]] = [
     {"url": "http://connect.rom.miui.com/generate_204", "expect_status": 204},
 ]
 
-_STR_FIELDS = ("username", "portal", "log_level")
+# 这里只有 log_level。username / portal 故意不放进来：它们要在下面单独处理
+# （strip、查 http(s):// 前缀），一旦“顺手”把它们加进来去重，strip 和 scheme
+# 校验就会一起失效，别做这个简化。
+_STR_FIELDS = ("log_level",)
 _INT_FIELDS = ("captcha_max_retry", "run_max_fail", "window_hours",
                "window_max_fail", "probe_timeout")
 _OPTIONAL_URL_FIELDS = ("login_page_url", "login_submit_url", "captcha_url")
+
+# 配置文件里允许出现的键，用于识别拼错的键（见 _warn_unknown_keys）。
+_KNOWN_KEYS = frozenset(
+    ("username", "portal", "probe_urls", "log_level")
+    + _INT_FIELDS
+    + _OPTIONAL_URL_FIELDS
+)
+
+# bool 要在 int 前面判断：bool 是 int 的子类，否则 true 会被当成 1。
+_TYPE_NAMES = ((bool, "布尔值"), (str, "字符串"), (int, "整数"),
+               (list, "列表"), (dict, "对象"))
 
 
 class ConfigError(Exception):
@@ -719,61 +855,175 @@ class Config:
     samples_dir: str = ""
 
 
-def _require(data: dict, key: str, types, where: str):
+def _type_name(value: Any) -> str:
+    for typ, name in _TYPE_NAMES:
+        if isinstance(value, typ):
+            return name
+    return type(value).__name__
+
+
+def _show(value: Any) -> str:
+    """把值渲染成给用户看的短字符串。"""
+    text = f'"{value}"' if isinstance(value, str) else repr(value)
+    return text if len(text) <= 40 else text[:37] + "..."
+
+
+def _bad_type(where: str, key: str, expected: str, value: Any) -> ConfigError:
+    msg = f"{where} 字段 {key} 期望{expected}，实际是{_type_name(value)} {_show(value)}"
+    if expected == "整数" and isinstance(value, str):
+        msg += "（数字不要加引号）"
+    return ConfigError(msg)
+
+
+def _require_str(data: dict, key: str, where: str) -> str:
     if key not in data:
         raise ConfigError(f"{where} 缺少必填字段: {key}")
     value = data[key]
-    if not isinstance(value, types):
-        raise ConfigError(f"{where} 字段 {key} 类型不对，期望 {types}，实际 {type(value).__name__}")
+    if not isinstance(value, str):
+        raise _bad_type(where, key, "字符串", value)
     return value
+
+
+def _check_url(where: str, key: str, value: str) -> str:
+    value = value.strip()
+    if not value.startswith(("http://", "https://")):
+        raise ConfigError(
+            f"{where} 字段 {key} 必须是 http(s):// 开头的地址，实际是 {_show(value)}"
+        )
+    return value
+
+
+def _validate_probe_urls(urls: list, where: str) -> list[dict[str, Any]]:
+    """逐条校验探测项，报错时指明是第几条（从 1 开始数）。"""
+    if not urls:
+        raise ConfigError(f"{where} 字段 probe_urls 不能为空列表")
+
+    cleaned: list[dict[str, Any]] = []
+    for index, entry in enumerate(urls, start=1):
+        label = f"{where} 字段 probe_urls[{index}]"
+
+        if not isinstance(entry, dict):
+            raise ConfigError(
+                f"{label} 必须是 JSON 对象（形如 "
+                '{"url": "...", "expect_status": 204}），'
+                f"实际是{_type_name(entry)} {_show(entry)}"
+            )
+
+        url = entry.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise ConfigError(
+                f"{label} 必须有 url，且是非空字符串，实际是 "
+                f"{_type_name(url)} {_show(url)}"
+            )
+
+        has_text = "expect_text" in entry
+        has_status = "expect_status" in entry
+        if has_text and has_status:
+            raise ConfigError(
+                f"{label} 的 expect_text 和 expect_status 只能给一个，不能同时给"
+            )
+        if not has_text and not has_status:
+            raise ConfigError(
+                f"{label} 必须给 expect_text（期望页面里出现的文字）"
+                f"或 expect_status（期望的 HTTP 状态码）之一"
+            )
+
+        item = dict(entry)
+        item["url"] = url.strip()
+
+        if has_text:
+            text = entry["expect_text"]
+            if not isinstance(text, str):
+                raise _bad_type(label, "expect_text", "字符串", text)
+        else:
+            status = entry["expect_status"]
+            if isinstance(status, bool) or not isinstance(status, int):
+                raise _bad_type(label, "expect_status", "整数", status)
+
+        cleaned.append(item)
+
+    return cleaned
+
+
+def _warn_unknown_keys(data: dict, where: str) -> None:
+    """拼错的键只警告、不报错。
+
+    用户拿到抓包后要手改的就是这些键，写错了却按默认值跑，会让登录请求打到
+    错误端点并一路累积失败，所以在日志里必须能看出来。
+    """
+    unknown = [key for key in data if key not in _KNOWN_KEYS]
+    if not unknown:
+        return
+
+    known = sorted(_KNOWN_KEYS)
+    for key in unknown:
+        hint = difflib.get_close_matches(str(key), known, n=1)
+        tail = f"，是不是想写 {hint[0]} ？" if hint else ""
+        log.warning("%s 里有无法识别的配置项 %s%s（已忽略，按默认值处理）",
+                    where, key, tail)
 
 
 def load(path: str = "config.json") -> Config:
     if not os.path.exists(path):
         raise ConfigError(f"找不到配置文件: {path}")
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        # utf-8-sig：记事本另存为 UTF-8 会带 BOM，用 utf-8 读会报一句开发者才看得懂的错。
+        with open(path, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
+    except UnicodeDecodeError as e:
+        raise ConfigError(
+            f"{path} 不是 UTF-8 编码，请用记事本打开，另存为时把编码选成 UTF-8: {e}"
+        ) from e
     except json.JSONDecodeError as e:
         raise ConfigError(f"{path} 不是合法的 JSON: {e}") from e
 
     if not isinstance(data, dict):
-        raise ConfigError(f"{path} 顶层必须是 JSON 对象")
+        raise ConfigError(f"{path} 顶层必须是 JSON 对象，实际是{_type_name(data)}")
 
-    where = os.path.basename(path)
+    where = path
 
-    username = _require(data, "username", str, where)
-    if not username.strip():
+    username = _require_str(data, "username", where).strip()
+    if not username:
         raise ConfigError(f"{where} 字段 username 不能为空")
 
-    portal = _require(data, "portal", str, where)
-    if not portal.startswith(("http://", "https://")):
-        raise ConfigError(f"{where} 字段 portal 必须是 http(s):// 开头的地址，实际是 {portal!r}")
-
+    portal = _check_url(where, "portal", _require_str(data, "portal", where))
     portal = portal.rstrip("/")
 
-    kwargs: dict[str, Any] = {"username": username.strip(), "portal": portal}
+    kwargs: dict[str, Any] = {"username": username, "portal": portal}
 
     for key in _INT_FIELDS:
         if key in data:
-            value = _require(data, key, int, where)
+            value = data[key]
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise _bad_type(where, key, "整数", value)
             if value <= 0:
                 raise ConfigError(f"{where} 字段 {key} 必须大于 0，实际是 {value}")
             kwargs[key] = value
 
     for key in _STR_FIELDS:
-        if key in data and key not in kwargs:
-            kwargs[key] = _require(data, key, str, where)
+        if key in data:
+            kwargs[key] = _require_str(data, key, where)
+
+    if "log_level" in kwargs:
+        level_name = kwargs["log_level"].strip().upper()
+        if level_name not in logging.getLevelNamesMapping():
+            raise ConfigError(
+                f"{where} 字段 log_level 取值非法: {_show(kwargs['log_level'])}，"
+                f"常用取值是 DEBUG / INFO / WARNING / ERROR"
+            )
+        kwargs["log_level"] = level_name
 
     if "probe_urls" in data:
-        urls = _require(data, "probe_urls", list, where)
-        if not urls:
-            raise ConfigError(f"{where} 字段 probe_urls 不能为空列表")
-        kwargs["probe_urls"] = [dict(u) for u in urls]
+        urls = data["probe_urls"]
+        if not isinstance(urls, list):
+            raise _bad_type(where, "probe_urls", "列表", urls)
+        kwargs["probe_urls"] = _validate_probe_urls(urls, where)
 
     for key in _OPTIONAL_URL_FIELDS:
         if key in data:
-            kwargs[key] = _require(data, key, str, where)
+            kwargs[key] = _check_url(where, key, _require_str(data, key, where))
+
+    _warn_unknown_keys(data, where)
 
     base_dir = os.path.dirname(os.path.abspath(path))
     cfg = Config(base_dir=base_dir, **kwargs)
@@ -796,7 +1046,7 @@ def load(path: str = "config.json") -> Config:
 python -m pytest tests/test_config.py -v
 ```
 
-Expected: 12 passed
+Expected: 39 passed
 
 - [ ] **Step 5: Commit**
 
@@ -2259,6 +2509,19 @@ git commit -m "feat: 验证码识别准确率统计工具"
 
 **前置：必须先取得点登录时的抓包。** 取得之前不要做本任务，其余任务不受影响。
 
+> **⚠️ 先判断一件事：登录页地址是静态的还是动态的？**
+>
+> 设计文档第 2 节记的那条登录页 URL 带了三个**运行时才有的**参数：
+> `flowSessionId`（每次流程现生成）、`userIp`、`userMac`（本机 IP 和 MAC）。
+> 而目前 `config.json` 里 `login_page_url` 只是一个**静态字符串**——它表达不了这种动态 URL。
+>
+> 两种可能，对应两种做法：
+>
+> - **静态**（大概率）：锐捷标准的 `InterFace.do?method=pageInfo` 由 AC 按源 IP 识别客户端，脚本直接请求固定地址即可。那就按本任务原样做，什么都不用加。
+> - **动态**：如果抓包显示是 AC 重定向过来的那条带参 URL，那么静态字符串这条路走不通，需要改成**让脚本自己跟随一次未认证请求的重定向**去发现登录页地址（请求探测地址 → 不开 `allow_redirects` → 读 `Location` 头 → 用那个 URL）。这才是通用做法，且不依赖把 IP/MAC 拼进模板。
+>
+> **这条必须在动手改字段之前定下来**，否则 Task 12 "改 config.json 就行" 的承诺对这个字段是不成立的。若判定为动态，先回来改设计与计划，再继续。
+
 - [ ] **Step 1: 提取抓包里的关键信息**
 
 从 cURL 里读出三样东西：
@@ -2476,6 +2739,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import logging
+import os
 import sys
 import time
 
@@ -2628,12 +2892,18 @@ def main(argv=None) -> int:
         parser.print_help()
         return 2
 
-    import os
     cfg_path = args.config or os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+    # 先按配置文件所在目录初始化日志，这样连"配置文件读不出来"这种错也能落盘。
+    # 计划任务跑起来时 stderr 是被丢掉的，不先开日志就等于什么都没留下。
+    # 正常情况下 cfg.log_path 与这个路径相同，下面的第二次 init 会被短路径判断短路掉。
+    fallback_log = os.path.join(os.path.dirname(os.path.abspath(cfg_path)), "campus-net.log")
+    logsetup.init(fallback_log, "DEBUG" if args.verbose else "INFO")
 
     try:
         cfg = load(cfg_path)
-    except ConfigError as e:
+    except (ConfigError, OSError) as e:
+        log.error("配置错误: %s", e)
         print(f"配置错误: {e}", file=sys.stderr)
         return 2
 

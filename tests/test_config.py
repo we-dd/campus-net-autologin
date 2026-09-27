@@ -1,4 +1,5 @@
 import json
+import logging
 
 import pytest
 
@@ -92,3 +93,112 @@ def test_bad_json_raises_readable_error(tmp_path):
     p.write_text("{not json", encoding="utf-8")
     with pytest.raises(ConfigError, match="不是合法的 JSON"):
         load(str(p))
+
+
+# --- 以下为评审补丁新增：probe_urls 形状校验 --------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_entry",
+    [
+        "http://x/",                                                      # 整条不是对象
+        [5],                                                              # 整条不是对象
+        5,                                                                # 整条不是对象
+        {"expect_status": 204},                                           # 缺 url
+        {"url": "   "},                                                   # url 是空白串
+        {"url": "http://x/", "expect_text": "a", "expect_status": 204},   # 两者都给
+        {"url": "http://x/"},                                             # 两者都没给
+        {"url": "http://x/", "expect_status": "204"},                     # expect_status 类型不对
+        {"url": "http://x/", "expect_status": True},                      # bool 不是整数
+        {"url": "http://x/", "expect_text": 5},                           # expect_text 类型不对
+    ],
+)
+def test_probe_urls_entry_shape_raises(tmp_path, bad_entry):
+    with pytest.raises(ConfigError, match="probe_urls"):
+        load(write(tmp_path, minimal(probe_urls=[bad_entry])))
+
+
+def test_probe_urls_error_names_index(tmp_path):
+    good = {"url": "http://ok/", "expect_status": 204}
+    with pytest.raises(ConfigError, match=r"probe_urls\[2\]"):
+        load(write(tmp_path, minimal(probe_urls=[good, {"nope": 1}])))
+
+
+def test_probe_urls_missing_url_is_config_error_not_raw_exception(tmp_path):
+    """缺 url 过去能加载成功，会让探测全部静默失败、误判成未登录。"""
+    with pytest.raises(ConfigError, match="url"):
+        load(write(tmp_path, minimal(probe_urls=[{"expect_status": 204}])))
+
+
+def test_valid_probe_urls_are_kept(tmp_path):
+    urls = [{"url": "http://ok/", "expect_status": 204, "note": "自定义键保留"}]
+    cfg = load(write(tmp_path, minimal(probe_urls=urls)))
+    assert cfg.probe_urls[0]["expect_status"] == 204
+    assert cfg.probe_urls[0]["note"] == "自定义键保留"
+
+
+# --- 以下为评审补丁新增：文件编码 --------------------------------------------
+
+
+def test_non_utf8_file_raises_readable_error(tmp_path):
+    p = tmp_path / "gbk.json"
+    p.write_bytes(
+        json.dumps(minimal(username="张三"), ensure_ascii=False).encode("gbk")
+    )
+    with pytest.raises(ConfigError, match="不是 UTF-8 编码"):
+        load(str(p))
+
+
+def test_utf8_bom_file_loads(tmp_path):
+    p = tmp_path / "bom.json"
+    p.write_bytes(b"\xef\xbb\xbf" + json.dumps(minimal()).encode("utf-8"))
+    assert load(str(p)).username == "2021001"
+
+
+# --- 以下为评审补丁新增：数值与 URL 取值 -------------------------------------
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["captcha_max_retry", "run_max_fail", "window_hours",
+     "window_max_fail", "probe_timeout"],
+)
+def test_bool_for_int_field_raises(tmp_path, field):
+    with pytest.raises(ConfigError, match=field):
+        load(write(tmp_path, minimal(**{field: True})))
+
+
+def test_portal_is_stripped(tmp_path):
+    cfg = load(write(tmp_path, minimal(portal="  http://10.71.29.181  ")))
+    assert cfg.portal == "http://10.71.29.181"
+    assert cfg.login_page_url == "http://10.71.29.181/eportal/InterFace.do?method=pageInfo"
+
+
+@pytest.mark.parametrize(
+    "field", ["login_page_url", "login_submit_url", "captcha_url"]
+)
+def test_url_fields_require_scheme(tmp_path, field):
+    with pytest.raises(ConfigError, match=field):
+        load(write(tmp_path, minimal(**{field: "10.71.29.181/eportal"})))
+
+
+# --- 以下为评审补丁新增：log_level 与拼错的键 --------------------------------
+
+
+def test_invalid_log_level_raises(tmp_path):
+    with pytest.raises(ConfigError, match="log_level"):
+        load(write(tmp_path, minimal(log_level="VERBOSE")))
+
+
+def test_unknown_key_warns_with_suggestion(tmp_path, caplog):
+    with caplog.at_level(logging.WARNING, logger="src.config"):
+        cfg = load(write(tmp_path, minimal(captcha_max_retrys=7)))
+    assert cfg.captcha_max_retry == 5
+    assert "captcha_max_retrys" in caplog.text
+    assert "是不是想写 captcha_max_retry" in caplog.text
+
+
+def test_known_keys_do_not_warn(tmp_path, caplog):
+    with caplog.at_level(logging.WARNING, logger="src.config"):
+        load(write(tmp_path, minimal(log_level="DEBUG", probe_timeout=9)))
+    assert caplog.text == ""
