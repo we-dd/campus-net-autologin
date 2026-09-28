@@ -6,7 +6,7 @@
   * 改代码立即生效，不需要重启任何东西
   * 不需要处理"开机时网络还没就绪"
 
-三个触发器：登录 Windows 时、每隔几分钟一次、网络状态变化时。
+四个触发器：登录 Windows 时、每隔几分钟一次、网络状态变化时、从睡眠唤醒时。
 
 间隔短是为了"网一掉就尽快恢复"，但登录失败后脚本自己会退避
 （见 config.json 的 retry_backoff_minutes），不会因为轮询快就把
@@ -87,6 +87,16 @@ $T3.Enabled = $true
 $T3.Subscription = '<QueryList><Query Id="0" Path="Microsoft-Windows-NetworkProfile/Operational"><Select Path="Microsoft-Windows-NetworkProfile/Operational">*[System[EventID=10000]]</Select></Query></QueryList>'
 $T3.Delay = 'PT10S'
 
+# 触发器 4：从睡眠唤醒时立刻跑一次。
+# 睡眠期间计划任务不会执行，醒来后网络往往是断的 —— 这条让它一睁眼就检查。
+# 用 Power-Troubleshooter 的 ID=1（"系统已从睡眠中恢复"），实测可靠。
+# 注意：这里的 Delay 是 0（不延迟），因为刚唤醒时网卡可能还没就绪，
+# 跑早了会判成"门户不可达"而跳过；但下一轮的 5 分钟轮询会兜住，
+# 而且网络变化事件也会再触发一次。宁可早跑一次也不要漏。
+$T4 = New-CimInstance -CimClass $evtClass -ClientOnly
+$T4.Enabled = $true
+$T4.Subscription = '<QueryList><Query Id="0" Path="System"><Select Path="System">*[System[Provider[@Name="Microsoft-Windows-Power-Troubleshooter"] and EventID=1]]</Select></Query></QueryList>'
+
 $Settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
@@ -103,14 +113,14 @@ $Principal = New-ScheduledTaskPrincipal `
 Register-ScheduledTask `
     -TaskName $TaskName `
     -Action $Action `
-    -Trigger @($T1, $T2, $T3) `
+    -Trigger @($T1, $T2, $T3, $T4) `
     -Settings $Settings `
     -Principal $Principal `
     -Description "校园网自动认证：定时探测，未认证时自动用浏览器登录。日志见 campus-net.log" | Out-Null
 
 Write-Host "已注册计划任务: $TaskName"
 Write-Host ""
-Write-Host "触发器: 登录时 + 每 $EveryMins 分钟 + 网络状态变化时"
+Write-Host "触发器: 登录时 + 每 $EveryMins 分钟 + 网络状态变化时 + 从睡眠唤醒时"
 Write-Host "查看:   schtasks /Query /TN $TaskName /V /FO LIST"
 Write-Host "手动跑: schtasks /Run /TN $TaskName"
 Write-Host "删除:   powershell -ExecutionPolicy Bypass -File uninstall_task.ps1"
