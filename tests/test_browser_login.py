@@ -1227,6 +1227,49 @@ def test_fill_keeps_stale_retryable():
         browser_login._fill(_El(), "value")
 
 
+# ---- Chrome 强制门户提示页的识别 ----
+# 文案取自 2026-09-28 开机时实际失败并落盘的 failure-*.html，不是编的。
+
+def test_interstitial_detected_from_real_page():
+    """实测那一页的标题和正文（原样抄自失败转储）。"""
+    title = "连接到 Wi-Fi 网络"
+    body = (
+        "连接到 Wi-Fi 网络 连接到 Wi-Fi 网络 "
+        "您要使用的 Wi-Fi 网络（SCITWiFi）可能需要您访问其登录页面。 "
+        "向 Google 发送 您访问的部分网页的网址、有限的系统信息以及部分网页内容 "
+        "隐私权政策 开启增强型保护 连接"
+    )
+    assert browser_login._looks_like_captive_portal_interstitial(title, body) is True
+
+
+def test_interstitial_detected_for_english_variants():
+    assert browser_login._looks_like_captive_portal_interstitial(
+        "Connect to Wi-Fi network", "Your Wi-Fi network may require you to sign in."
+    ) is True
+    assert browser_login._looks_like_captive_portal_interstitial(
+        "Sign in to network", ""
+    ) is True
+
+
+def test_real_login_page_is_not_mistaken_for_interstitial():
+    """真正的登录页不能被误判 —— 误判会去点根本不存在的按钮，白白耽误一轮。"""
+    # 自助服务登录页（实测渲染结果）
+    assert browser_login._looks_like_captive_portal_interstitial(
+        "自助服务",
+        "自助服务 用户名密码 换一个 忘记密码 立即登录 "
+        "请先阅读并同意《用户协议》《免责声明协议》《用户隐私协议》",
+    ) is False
+    # 认证系统登录页
+    assert browser_login._looks_like_captive_portal_interstitial(
+        "四川工业科技学院认证系统",
+        "认证系统 用户名密码 换一个 忘记密码 立即登录",
+    ) is False
+
+
+def test_interstitial_detection_handles_empty_input():
+    assert browser_login._looks_like_captive_portal_interstitial("", "") is False
+
+
 def _recorder(sink):
     """假的 captcha.recognize：把收到的图片字节记进 sink，并回一个非空结果。"""
     def _fake(png_bytes):

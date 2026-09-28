@@ -799,6 +799,78 @@ def _quit(driver) -> None:
         log.warning("关闭浏览器失败（忽略）: %s", e)
 
 
+# Chrome 自己的强制门户提示页特征词。
+#
+# 校园网需要认证时，Chrome 会抢在 AC 前面弹它自己的"连接到 Wi-Fi 网络"页面，
+# 把真正的登录页挡住。脚本看到的就是"有按钮、没有输入框"，于是判成
+# not_login_page 放弃 —— 2026-09-28 开机时实测踩到的就是这个。
+_CHROME_INTERSTITIAL_MARKERS = (
+    "连接到 wi-fi 网络",
+    "连接到 wi-fi",
+    "登录到网络",
+    "connect to wi-fi",
+    "sign in to network",
+    "captive portal",
+)
+
+
+def _looks_like_captive_portal_interstitial(title: str, body_text: str) -> bool:
+    """标题或正文里有没有 Chrome 提示页的特征词。
+
+    单独抽成纯函数是为了能测：驱动相关的部分跑不起来，但"认不认得出这一页"
+    是纯字符串判断，可以拿实测到的真实文案直接验。
+    """
+    haystack = f"{title} {body_text}".lower()
+    return any(marker in haystack for marker in _CHROME_INTERSTITIAL_MARKERS)
+
+
+def _dismiss_captive_portal_interstitial(driver) -> bool:
+    """点掉 Chrome 的强制门户提示页，让浏览器跳到真正的登录页。返回是否点过。
+
+    双重确认：特征词对得上 **并且** 存在 button#primary-button（实测该页主按钮的
+    固定 id）。只看按钮 id 可能误点别的页面，只看文字又可能被登录页里的文案骗到。
+    """
+    try:
+        title = driver.title or ""
+    except WebDriverException:
+        return False
+
+    try:
+        body_text = driver.find_element(By.CSS_SELECTOR, "body").text or ""
+    except WebDriverException:
+        return False
+
+    if not _looks_like_captive_portal_interstitial(title, body_text):
+        return False
+
+    try:
+        button = driver.find_element(By.CSS_SELECTOR, "button#primary-button")
+    except (NoSuchElementException, WebDriverException):
+        return False
+
+    try:
+        # JS 点击：这一页的按钮跟 ant-design 那些一样，普通点击可能被判定不可交互
+        driver.execute_script("arguments[0].click();", button)
+    except WebDriverException as e:
+        log.warning("点 Chrome 强制门户提示页失败: %s", e)
+        return False
+
+    log.info("检测到 Chrome 自己的强制门户提示页，已点掉「连接」")
+    return True
+
+
+def _settle_and_dismiss_interstitial(driver) -> None:
+    """等页面稳定；若落到了 Chrome 的强制门户提示页就点掉，再等一次稳定。
+
+    登录流程和 --dump-form 都要走这一步：校准选择器的时候同样会撞上这一页，
+    不处理的话用户跑 --dump-form 看到的是 Chrome 的提示页，校准无从谈起。
+    """
+    _wait_for_settle(driver, time.monotonic() + _SETTLE_TIMEOUT, _SETTLE_TIMEOUT)
+    if _dismiss_captive_portal_interstitial(driver):
+        # 点完之后浏览器会跳到真正的登录页，重新等它稳定
+        _wait_for_settle(driver, time.monotonic() + _SETTLE_TIMEOUT, _SETTLE_TIMEOUT)
+
+
 def _navigate(driver, cfg: Config) -> bool:
     """打开登录页，返回这次导航是否超时。
 
@@ -1593,6 +1665,7 @@ def _run(cfg: Config, password: str) -> Result:
     try:
         driver = _build_driver(cfg, profile)
         nav_timed_out = _navigate(driver, cfg)
+        _settle_and_dismiss_interstitial(driver)
         result = _attempt_loop(driver, cfg, password, nav_timed_out)
         if not result.ok:
             # 失败现场必须在关掉浏览器之前落盘——关掉就什么都没有了。
@@ -1658,7 +1731,8 @@ def dump_form(cfg: Config) -> Result:
         driver = _build_driver(cfg, profile)
         nav_timed_out = _navigate(driver, cfg)
         # 用户拿 --dump-form 校准选择器，采到半张还在渲染的页面等于白跑一趟。
-        _wait_for_settle(driver, time.monotonic() + _SETTLE_TIMEOUT, _SETTLE_TIMEOUT)
+        # 同时处理 Chrome 的强制门户提示页，否则采到的是 Chrome 的页面。
+        _settle_and_dismiss_interstitial(driver)
         _elements, descriptors = _collect(driver)
 
         controls = [d for d in descriptors if d["tag"] != "img"]
