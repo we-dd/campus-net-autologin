@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 
 from selenium import webdriver
 from selenium.common.exceptions import (
+    NoAlertPresentException,
     NoSuchElementException,
     StaleElementReferenceException,
     TimeoutException,
@@ -849,6 +850,36 @@ def _looks_like_chrome_interstitial_by_shape(
     return has_primary and has_details and not has_password_input
 
 
+def _drain_alert(driver) -> str | None:
+    """有 JS 弹窗就记下它的文字并关掉。返回弹窗文字，没有就返回 None。
+
+    为什么必须处理：实测门户在某些情况下返回一个只有 alert 的极小页面，例如
+    `<html><head><script>alert('设备未注册,请联系管理员');</script></head></html>`
+    —— 正文是空的（78 字节），采集到的元素数是 0。
+    只看元素清单完全看不出发生了什么，而**那句 alert 就是全部答案**
+    （2026-09-28 就是靠翻失败转储里的 HTML 才找到它的）。
+
+    另外 alert 会挂住页面上的 JS 执行，不处理可能让后续操作超时。
+    """
+    try:
+        alert = driver.switch_to.alert
+    except (NoAlertPresentException, WebDriverException):
+        return None
+
+    try:
+        text = alert.text or ""
+    except WebDriverException:
+        text = ""
+
+    try:
+        alert.accept()
+    except WebDriverException as e:
+        log.debug("关掉弹窗失败: %s", e)
+
+    log.warning("页面弹出了 JS 对话框，内容是页面给的线索: %r", text[:200])
+    return text
+
+
 def _detect_captive_portal_interstitial(driver) -> str | None:
     """当前页是不是 Chrome 的强制门户提示页？返回匹配方式，不是就返回 None。
 
@@ -937,12 +968,26 @@ def _settle_and_dismiss_interstitial(driver, cfg) -> None:
     budget = _SETTLE_TIMEOUT
     _wait_for_settle(driver, time.monotonic() + budget, budget)
 
+    # 有的门户会用 alert() 把真正的原因写在弹窗里（正文是空的）。
+    # 不主动去读，它就只是"页面上 0 个元素"这么一个没法解释的现象。
+    _drain_alert(driver)
+
     for _ in range(2):
         if _detect_captive_portal_interstitial(driver) is None:
             return
+
+        windows_before = set(driver.window_handles)
         if not _click_interstitial_primary(driver):
             break
         _wait_for_settle(driver, time.monotonic() + budget, budget)
+
+        # Chrome 的「连接」有可能把门户开在**新标签页**里。不切过去的话我们还停在
+        # 提示页那一页，采集到的当然是空的 —— 表现为"点了没反应"。
+        new_windows = [h for h in driver.window_handles if h not in windows_before]
+        if new_windows:
+            driver.switch_to.window(new_windows[-1])
+            log.info("提示页的按钮把门户开在了新标签页，已切过去")
+            _wait_for_settle(driver, time.monotonic() + budget, budget)
 
     if _detect_captive_portal_interstitial(driver) is None:
         return
