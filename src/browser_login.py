@@ -849,71 +849,111 @@ def _looks_like_chrome_interstitial_by_shape(
     return has_primary and has_details and not has_password_input
 
 
-def _dismiss_captive_portal_interstitial(driver) -> bool:
-    """点掉 Chrome 的强制门户提示页，让浏览器跳到真正的登录页。返回是否点过。
+def _detect_captive_portal_interstitial(driver) -> str | None:
+    """当前页是不是 Chrome 的强制门户提示页？返回匹配方式，不是就返回 None。
 
-    双重确认：特征词对得上 **并且** 存在 button#primary-button（实测该页主按钮的
-    固定 id）。只看按钮 id 可能误点别的页面，只看文字又可能被登录页里的文案骗到。
+    双重确认：存在 button#primary-button，**并且**（特征词对得上 或 结构对得上）。
+    只看按钮 id 可能误点别的页面，只看文字又会被 Chrome 改措辞搞垮。
     """
     try:
         title = driver.title or ""
+        body_text = driver.find_element(By.CSS_SELECTOR, "body").text or ""
+        has_primary = bool(
+            driver.find_elements(By.CSS_SELECTOR, "button#primary-button")
+        )
     except WebDriverException:
-        return False
+        return None
+
+    if not has_primary:
+        return None
+
+    if _looks_like_captive_portal_interstitial(title, body_text):
+        return "text"
 
     try:
-        body_text = driver.find_element(By.CSS_SELECTOR, "body").text or ""
+        has_details = bool(
+            driver.find_elements(By.CSS_SELECTOR, "button#details-button")
+        )
+        has_password = bool(
+            driver.find_elements(By.CSS_SELECTOR, "input[type=password]")
+        )
     except WebDriverException:
-        return False
+        return None
 
-    if not _looks_like_captive_portal_interstitial(title, body_text):
-        # 文案没认出来。退一步看结构 —— 这条路不看文案，Chrome 改措辞也不会失效。
-        try:
-            has_details = bool(
-                driver.find_elements(By.CSS_SELECTOR, "button#details-button")
-            )
-            has_password = bool(
-                driver.find_elements(By.CSS_SELECTOR, "input[type=password]")
-            )
-        except WebDriverException:
-            return False
-
-        if not _looks_like_chrome_interstitial_by_shape(True, has_details, has_password):
-            log.debug("有 Chrome 提示页的主按钮，但文案和结构都不匹配，按普通页面处理")
-            return False
-
+    if _looks_like_chrome_interstitial_by_shape(True, has_details, has_password):
         log.warning(
             "文案没匹配上特征词，但结构上就是 Chrome 的提示页，按提示页处理；"
             "标题=%r 正文开头=%r —— 建议把这句文案补进 _CHROME_INTERSTITIAL_MARKERS",
             title[:60],
             body_text[:120],
         )
+        return "shape"
 
+    log.debug("有 Chrome 提示页的主按钮，但文案和结构都不匹配，按普通页面处理")
+    return None
+
+
+def _click_interstitial_primary(driver) -> bool:
+    """按 Chrome 提示页的主按钮。返回是否按到了。
+
+    **必须优先用原生点击。** Chrome 的内建页面（这个提示页就是）只认真实用户手势，
+    execute_script 里的合成 .click() 它不认 —— 2026-09-28 实测栽在这：日志说
+    "已点掉「连接」"，但点完之后页面一个字节都没变（前后两次失败转储 MD5 完全相同）。
+    原生点击不可交互时才退回 JS 点击。
+    """
     try:
         button = driver.find_element(By.CSS_SELECTOR, "button#primary-button")
     except (NoSuchElementException, WebDriverException):
         return False
 
     try:
-        # JS 点击：这一页的按钮跟 ant-design 那些一样，普通点击可能被判定不可交互
-        driver.execute_script("arguments[0].click();", button)
+        button.click()
+        log.info("检测到 Chrome 的强制门户提示页，已用原生点击按下「连接」")
+        return True
     except WebDriverException as e:
-        log.warning("点 Chrome 强制门户提示页失败: %s", e)
+        log.debug("原生点击失败（%s），改用 JS 点击", type(e).__name__)
+
+    try:
+        driver.execute_script("arguments[0].click();", button)
+        log.info("检测到 Chrome 的强制门户提示页，已用 JS 点击按下「连接」")
+        return True
+    except WebDriverException as e:
+        log.warning("点 Chrome 提示页失败: %s", e)
         return False
 
-    log.info("检测到 Chrome 自己的强制门户提示页，已点掉「连接」")
-    return True
 
+def _settle_and_dismiss_interstitial(driver, cfg) -> None:
+    """等页面稳定；若落到 Chrome 的强制门户提示页，设法走到真正的登录页。
 
-def _settle_and_dismiss_interstitial(driver) -> None:
-    """等页面稳定；若落到了 Chrome 的强制门户提示页就点掉，再等一次稳定。
+    两条路按顺序试：
+      1. 按它自己的「连接」按钮（原生点击）
+      2. 按了还停在提示页 → 自己直接导航到门户地址
 
-    登录流程和 --dump-form 都要走这一步：校准选择器的时候同样会撞上这一页，
-    不处理的话用户跑 --dump-form 看到的是 Chrome 的提示页，校准无从谈起。
+    第 2 条是必需的兜底，不是锦上添花：Chrome 的内建页面不认合成点击，
+    而原生点击也可能因为各种原因无效，只靠点按钮就会永远卡在这一页。
+
+    登录流程和 --dump-form 都要走这一步 —— 校准选择器时同样会撞上这一页。
     """
-    _wait_for_settle(driver, time.monotonic() + _SETTLE_TIMEOUT, _SETTLE_TIMEOUT)
-    if _dismiss_captive_portal_interstitial(driver):
-        # 点完之后浏览器会跳到真正的登录页，重新等它稳定
-        _wait_for_settle(driver, time.monotonic() + _SETTLE_TIMEOUT, _SETTLE_TIMEOUT)
+    budget = _SETTLE_TIMEOUT
+    _wait_for_settle(driver, time.monotonic() + budget, budget)
+
+    for _ in range(2):
+        if _detect_captive_portal_interstitial(driver) is None:
+            return
+        if not _click_interstitial_primary(driver):
+            break
+        _wait_for_settle(driver, time.monotonic() + budget, budget)
+
+    if _detect_captive_portal_interstitial(driver) is None:
+        return
+
+    log.warning("点掉提示页后仍停在提示页，改为直接导航到门户 %s", cfg.portal)
+    try:
+        driver.get(cfg.portal)
+    except WebDriverException as e:
+        log.warning("直接导航到门户失败: %s", e)
+        return
+    _wait_for_settle(driver, time.monotonic() + budget, budget)
 
 
 def _navigate(driver, cfg: Config) -> bool:
@@ -1710,7 +1750,7 @@ def _run(cfg: Config, password: str) -> Result:
     try:
         driver = _build_driver(cfg, profile)
         nav_timed_out = _navigate(driver, cfg)
-        _settle_and_dismiss_interstitial(driver)
+        _settle_and_dismiss_interstitial(driver, cfg)
         result = _attempt_loop(driver, cfg, password, nav_timed_out)
         if not result.ok:
             # 失败现场必须在关掉浏览器之前落盘——关掉就什么都没有了。
@@ -1777,7 +1817,7 @@ def dump_form(cfg: Config) -> Result:
         nav_timed_out = _navigate(driver, cfg)
         # 用户拿 --dump-form 校准选择器，采到半张还在渲染的页面等于白跑一趟。
         # 同时处理 Chrome 的强制门户提示页，否则采到的是 Chrome 的页面。
-        _settle_and_dismiss_interstitial(driver)
+        _settle_and_dismiss_interstitial(driver, cfg)
         _elements, descriptors = _collect(driver)
 
         controls = [d for d in descriptors if d["tag"] != "img"]
