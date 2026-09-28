@@ -1962,6 +1962,16 @@ def _select_service(driver, cfg: Config) -> bool:
     if not want:
         return False
 
+    # **必须先切回顶层文档。**
+    # CAS 登录是在 iframe 里完成的（见 _wait_for_login_form），而"请选择服务"
+    # 这个弹窗出现在**顶层**。停在 iframe 里怎么找都找不到 ——
+    # 2026-09-28 12:25 实测就是这样：日志说"没看到需要选运营商"，而截图里
+    # 弹窗明明写着「请选择服务 / 中国电信 / 校园网 / 中国移动 / 中国联通 / 确定」。
+    try:
+        driver.switch_to.default_content()
+    except WebDriverException as e:
+        log.debug("切回顶层失败: %s", e)
+
     deadline = time.monotonic() + _SETTLE_TIMEOUT
     while time.monotonic() < deadline:
         try:
