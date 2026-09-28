@@ -1455,14 +1455,50 @@ def _submit(driver, f: _Fields) -> None:
         _press_enter(f.password)
 
 
+def _wait_for_login_form(driver, cfg: Config, deadline: float) -> None:
+    """等登录表单真正渲染出来再采集。
+
+    实测（2026-09-28 11:17）：门户是 Angular 单页应用，先给一张骨架页，组件是
+    后来才水合进去的 —— 那页的样式里带着 `visibility:hidden` 和
+    `.hydrated{visibility:inherit}`，三个 img 的 src 还都是空的。
+    在骨架阶段采集会得到"0 个可见输入框"，随后被判成 not_login_page 直接放弃。
+    **页面对了、地址对了，只是采早了。**
+
+    等的是"账号框和密码框都能认出来"，而不是"页面上有 input"：骨架页也可能
+    已经有 input，得等到真能认出字段才算好。等不到就按当前状态继续，
+    由调用方照常报 not_login_page —— 只是这次是等够了才报的。
+    """
+    while True:
+        try:
+            f = _gather(driver, cfg)
+        except (_PageChanged, StaleElementReferenceException):
+            f = None                      # 正渲染到一半，下一轮再看
+        except WebDriverException as e:
+            log.debug("等表单时页面异常，按当前状态继续: %s", e)
+            return
+
+        if f is not None and f.username is not None and f.password is not None:
+            log.debug("登录表单已渲染出来")
+            return
+
+        if time.monotonic() >= deadline:
+            log.warning("等登录表单渲染超时，按当前页面状态继续")
+            return
+        time.sleep(_SETTLE_STEP)
+
+
 def _prepare(driver, cfg: Config, password: str, nav_timed_out: bool,
              attempt: int) -> _Outcome:
-    """可重来段：等页面就绪 → 采集 → 定位 → 填表 → 勾选 → 提交。
+    """可重来段：等页面就绪 → 等表单渲染 → 采集 → 定位 → 填表 → 勾选 → 提交。
 
     这一段里遇到 stale 是安全的：什么都没有提交，重来一轮不会重复打认证服务器，
     也不消耗 captcha_max_retry。
     """
     _wait_until_ready(driver, cfg, time.monotonic() + _SETTLE_TIMEOUT, _SETTLE_TIMEOUT)
+
+    # 就绪不等于渲染完：Angular 单页应用还要水合。不等这一步会在骨架页上采集到
+    # 0 个输入框，然后被误判成"不是登录页"。
+    _wait_for_login_form(driver, cfg, time.monotonic() + _SETTLE_TIMEOUT)
 
     f = _gather(driver, cfg)
 
