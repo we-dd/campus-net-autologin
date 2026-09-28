@@ -69,6 +69,20 @@ $T2 = New-ScheduledTaskTrigger `
     -At (Get-Date).AddMinutes(2) `
     -RepetitionInterval (New-TimeSpan -Minutes $EveryMins)
 
+# 触发器 3：网络状态一变就立刻跑一次。
+# PowerShell 5.1 没有对应的事件触发器 cmdlet，得用 CIM 手工构造。
+# 监听 NetworkProfile 的 10000（网络已连接），这样开机后网卡一就绪就马上检查，
+# 不用干等下一个 30 分钟节点。
+#
+# 注意：它**不能**覆盖"被校园网踢下线"——那种情况发生在 AC 那边，网卡本身没变化，
+# Windows 不会发事件。被踢下线只能靠定时轮询兜住。
+$evtClass = Get-CimClass -Namespace root/Microsoft/Windows/TaskScheduler `
+    -ClassName MSFT_TaskEventTrigger
+$T3 = New-CimInstance -CimClass $evtClass -ClientOnly
+$T3.Enabled = $true
+$T3.Subscription = '<QueryList><Query Id="0" Path="Microsoft-Windows-NetworkProfile/Operational"><Select Path="Microsoft-Windows-NetworkProfile/Operational">*[System[EventID=10000]]</Select></Query></QueryList>'
+$T3.Delay = 'PT10S'
+
 $Settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
@@ -85,14 +99,14 @@ $Principal = New-ScheduledTaskPrincipal `
 Register-ScheduledTask `
     -TaskName $TaskName `
     -Action $Action `
-    -Trigger @($T1, $T2) `
+    -Trigger @($T1, $T2, $T3) `
     -Settings $Settings `
     -Principal $Principal `
     -Description "校园网自动认证：定时探测，未认证时自动用浏览器登录。日志见 campus-net.log" | Out-Null
 
 Write-Host "已注册计划任务: $TaskName"
 Write-Host ""
-Write-Host "触发器: 登录时 + 每 $EveryMins 分钟"
+Write-Host "触发器: 登录时 + 每 $EveryMins 分钟 + 网络状态变化时"
 Write-Host "查看:   schtasks /Query /TN $TaskName /V /FO LIST"
 Write-Host "手动跑: schtasks /Run /TN $TaskName"
 Write-Host "删除:   powershell -ExecutionPolicy Bypass -File uninstall_task.ps1"

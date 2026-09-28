@@ -75,13 +75,43 @@ def test_portal_down_when_hijack_seen_but_portal_unreachable():
     assert check(cfg(), s) is State.PORTAL_DOWN
 
 
-def test_unknown_when_response_neither_expected_nor_hijack():
+def test_unauthed_when_portal_reachable_but_probes_unexpected():
+    """门户可达 + 外网响应不符合预期 → 未认证。
+
+    这条曾经断言 UNKNOWN，那是错的：门户可达就说明我们在校园网里，外网不通
+    只可能是没认证。判成 UNKNOWN 会导致不登录、干等下一轮，实测表现就是
+    「开机后网络一直连不上，最后只能手动登」。
+    """
     s = FakeSession({
         PROBE1: FakeResponse(500, "server error", headers={"Content-Type": "text/plain"}),
         PROBE2: FakeResponse(500, "server error", headers={"Content-Type": "text/plain"}),
         PORTAL: FakeResponse(200, "<html>portal</html>"),
     })
-    assert check(cfg(), s) is State.UNKNOWN
+    assert check(cfg(), s) is State.UNAUTHED
+
+
+def test_unauthed_when_intercept_returns_200_without_content_type():
+    """最贴近实测形态的一条：AC 回 200、没有 Content-Type、正文是拦截内容。
+
+    它不是 302（所以不像劫持），也不匹配 expect_text（所以不符合预期）。
+    旧逻辑在这里判 UNKNOWN，正是线上踩到的那个坑。
+    """
+    s = FakeSession({
+        PROBE1: FakeResponse(200, "<script>location.href='http://portal/'</script>", headers={}),
+        PROBE2: FakeResponse(200, "", headers={}),
+        PORTAL: FakeResponse(200, "", headers={}),
+    })
+    assert check(cfg(), s) is State.UNAUTHED
+
+
+def test_no_unknown_state_anymore():
+    """UNKNOWN 状态已被移除。
+
+    它的语义是"说不清所以什么都别做"，但实测只在"其实该登录"的时候触发，
+    导致开机后网络一直不恢复。宁可多试一次（有防锁号兜底），也不要该动手时不动手。
+    """
+    assert not hasattr(State, "UNKNOWN")
+    assert {s.value for s in State} == {"online", "unauthed", "portal_down"}
 
 
 def test_probe_does_not_follow_redirects():

@@ -101,9 +101,12 @@ def run_check(cfg) -> int:
         log.info("已在线，无需操作")
         return 0
 
-    if net in (probe.State.PORTAL_DOWN, probe.State.UNKNOWN):
-        # 这两种情况登录注定失败，而每次失败都在累积锁号风险，不能白试
-        log.warning("网络层问题（%s），跳过登录", net.value)
+    if net is probe.State.PORTAL_DOWN:
+        # 门户都摸不到，登录也摸不到，跳过。
+        # 注意这里以前还包含一个 UNKNOWN 状态（"说不清就什么都别做"），
+        # 已随 probe 一起移除：实测它会在"其实该登录"的时候触发，导致开机后
+        # 一直不恢复。宁可多试一次（有防锁号兜底），也不要该动手时不动手。
+        log.warning("门户不可达，跳过登录")
         return 0
 
     if state.is_stopped(st, now, cfg.window_hours):

@@ -74,14 +74,20 @@ def test_check_skips_login_when_portal_is_unreachable(tmp_path, monkeypatch):
     assert calls == []
 
 
-def test_check_skips_login_when_state_is_unknown(tmp_path, monkeypatch):
+def test_check_logs_in_when_portal_reachable_but_internet_is_not(tmp_path, monkeypatch):
+    """门户可达 + 外网不通 → 去登录。
+
+    这条守的是一个真实踩过的坑：AC 拦截时常用 200 + 不带 Content-Type 返回
+    拦截内容，旧逻辑会判成"说不清"然后什么都不做，表现就是开机后网络一直
+    连不上，最后只能手动登。现在这种状态就是 UNAUTHED。
+    """
     cfg, path = make_cfg(tmp_path)
     calls = []
-    patch_net(monkeypatch, probe.State.UNKNOWN)
+    patch_net(monkeypatch, probe.State.UNAUTHED)
     patch_login(monkeypatch, Result(True, "success"), calls)
 
     assert cli.main(["--check", "--config", path]) == 0
-    assert calls == []
+    assert len(calls) == 1
 
 
 # --- 防锁号护栏 -------------------------------------------------------------
