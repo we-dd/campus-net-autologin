@@ -1939,6 +1939,95 @@ def _dump_failure(driver, cfg: Config, password: str, reason: str) -> str:
     return text
 
 
+def _xpath_literal(text: str) -> str:
+    """把字符串安全地嵌进 XPath 字面量（含引号也不会把表达式拼坏）。"""
+    if "'" not in text:
+        return "'%s'" % text
+    if '"' not in text:
+        return '"%s"' % text
+    parts = text.split("'")
+    return "concat(%s)" % ", \"'\", ".join("'%s'" % p for p in parts)
+
+
+def _select_service(driver, cfg: Config) -> bool:
+    """如果页面上要选运营商，选配置里那一个。返回是否点过。
+
+    为什么需要：账号登进 CAS 之后，门户还要选一次用哪个运营商（我们是中国电信）。
+    **不选的话网络不开闸** —— CAS 登录成功、网络却始终不通，于是每 5 分钟重登一次。
+    2026-09-28 实测就是这个循环，用户手动登录时是顺手选了运营商才通的。
+
+    选完可能还要点一次确定/连接，这里一并处理。
+    """
+    want = (cfg.service or "").strip()
+    if not want:
+        return False
+
+    deadline = time.monotonic() + _SETTLE_TIMEOUT
+    while time.monotonic() < deadline:
+        try:
+            # 找"文字里含服务名"的可点元素；不限定标签，各家的门户写法不一样
+            found = driver.find_elements(
+                By.XPATH,
+                "//*[self::button or self::a or self::li or self::label"
+                " or self::div or self::span or self::p]"
+                "[contains(normalize-space(.), %s)]" % _xpath_literal(want),
+            )
+        except WebDriverException as e:
+            log.debug("找运营商选项失败: %s", e)
+            return False
+
+        # 取文字最短的那个 —— 外层大容器也会命中，但它们的文字长得多
+        best = None
+        for el in found:
+            try:
+                if not el.is_displayed():
+                    continue
+                text = (el.text or "").strip()
+                if want not in text:
+                    continue
+                if best is None or len(text) < len(best[1]):
+                    best = (el, text)
+            except WebDriverException:
+                continue
+
+        if best is not None:
+            el, text = best
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                driver.execute_script("arguments[0].click();", el)
+                log.info("已点选运营商「%s」（元素文字=%r）", want, text[:40])
+            except WebDriverException as e:
+                log.warning("点运营商选项失败: %s", e)
+                return False
+
+            time.sleep(_SETTLE_STEP)
+            # 有的页面选完还要点一次确定/连接才生效
+            for label in ("确定", "确认", "下一步", "立即连接", "连接", "登录"):
+                try:
+                    btns = driver.find_elements(
+                        By.XPATH,
+                        "//*[self::button or self::a][normalize-space(.)=%s]"
+                        % _xpath_literal(label),
+                    )
+                except WebDriverException:
+                    btns = []
+                for b in btns:
+                    try:
+                        if b.is_displayed():
+                            driver.execute_script("arguments[0].click();", b)
+                            log.info("选完运营商后点了「%s」", label)
+                            time.sleep(_SETTLE_STEP)
+                            return True
+                    except WebDriverException:
+                        continue
+            return True
+
+        time.sleep(_SETTLE_STEP)
+
+    log.info("没看到需要选运营商（%s），跳过这一步", want)
+    return False
+
+
 def _confirm_network_up(cfg: Config, deadline: float) -> bool:
     """轮询网络，确认它真的通了。**此期间浏览器必须还开着。**
 
@@ -1977,6 +2066,10 @@ def _run(cfg: Config, password: str) -> Result:
         if result.ok:
             # 页面说成功不算数 —— 网络真通了才算。**浏览器此时还不能关**，
             # 见 _confirm_network_up 的说明。
+            #
+            # 顺序要紧：先选运营商（不选网络不开闸），再等网络放行。
+            _select_service(driver, cfg)
+
             if _confirm_network_up(cfg, time.monotonic() + _NETWORK_CONFIRM_TIMEOUT):
                 log.info("复探确认：网络已连通")
             else:

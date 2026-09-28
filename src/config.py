@@ -98,6 +98,14 @@ class Config:
     # 看到它在做什么，出问题时也能立刻发现。
     browser: str = "edge"
     headless: bool = False
+
+    # 运营商（服务）名称。留空表示不做这一步。
+    #
+    # 为什么需要它：账号登进 CAS 之后，门户还要选一次"用哪个运营商"，
+    # 不选的话**网络不开闸** —— 表现就是 CAS 登录成功、但网络始终不通，
+    # 于是每 5 分钟重登一次（2026-09-28 实测踩到）。
+    # 填页面上那个选项的文字即可，例如「中国电信」「校园网」。
+    service: str = ""
     # 留空表示不直接指定登录页，而是打开探测地址、让门户把浏览器劫持过去。
     login_url: str = ""
     # 元素定位的覆盖项：{"username": "#user", "captcha_image": "#validcodeImg", ...}
@@ -354,6 +362,10 @@ def load(path: str = "config.json") -> Config:
         if not isinstance(data["headless"], bool):
             raise _bad_type(where, "headless", "布尔值", data["headless"])
         kwargs["headless"] = data["headless"]
+
+    if "service" in data:
+        # 留空合法，表示不做"选运营商"这一步。
+        kwargs["service"] = _require_str(data, "service", where).strip()
 
     if "login_url" in data:
         # 留空合法，表示"打开探测地址、让门户把浏览器劫持到登录页"，这是默认行为。
