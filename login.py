@@ -134,7 +134,30 @@ def run_check(cfg) -> int:
             return 0
 
     log.info("检测到未认证，开始登录")
-    return do_login(cfg, st, now)
+    rc = do_login(cfg, st, now)
+
+    # 登录报"成功"（页面上的密码框消失）**不等于网络真的通了**。
+    # 实测 2026-09-28 11:36 起出现过每 5 分钟就要重登一次的循环：
+    # 脚本每次判成功、清空失败计数，下一轮又发现没网，再登一次。
+    # 怀疑登录认证的是网页会话，而没有打开网络准入。
+    # 所以这里立刻复探一次，把真实结果写进日志 —— 有这一行，是"真的通了"
+    # 还是"只登进了网页"就一目了然，不用再靠用户手动登录来推断。
+    if rc == 0:
+        try:
+            with _new_session() as session:
+                after = probe.check(cfg, session)
+            if after is probe.State.ONLINE:
+                log.info("复探确认：网络确实已通")
+            else:
+                log.error(
+                    "复探发现问题：登录报成功，但网络仍是 %s —— "
+                    "这次登录很可能只认证了网页会话，没有打开网络准入",
+                    after.value,
+                )
+        except Exception as e:
+            log.warning("登录后复探失败: %s", e)
+
+    return rc
 
 
 def run_login(cfg) -> int:
