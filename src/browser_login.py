@@ -1455,35 +1455,62 @@ def _submit(driver, f: _Fields) -> None:
         _press_enter(f.password)
 
 
+def _context_has_login_form(driver, cfg: Config) -> bool:
+    """当前浏览上下文里能不能认出账号框和密码框。认不出就说明还没到登录页。"""
+    try:
+        f = _gather(driver, cfg)
+    except (_PageChanged, StaleElementReferenceException, WebDriverException):
+        return False
+    return f.username is not None and f.password is not None
+
+
 def _wait_for_login_form(driver, cfg: Config, deadline: float) -> None:
-    """等登录表单真正渲染出来再采集。
+    """等登录表单真正渲染出来 —— **顶层找不到就切进 iframe 找**。
 
-    实测（2026-09-28 11:17）：门户是 Angular 单页应用，先给一张骨架页，组件是
-    后来才水合进去的 —— 那页的样式里带着 `visibility:hidden` 和
-    `.hydrated{visibility:inherit}`，三个 img 的 src 还都是空的。
-    在骨架阶段采集会得到"0 个可见输入框"，随后被判成 not_login_page 直接放弃。
-    **页面对了、地址对了，只是采早了。**
+    实测（2026-09-28 11:29）走了两次弯路才定位到：
+      1. 门户顶层是个 Angular 空壳，组件渲染完但里面没有表单；
+         截图里表单却完整可见（账号框、密码框、验证码图、登录按钮、协议框全在）。
+      2. 真正的原因是**登录页被塞在 iframe 里**：
+           <iframe class="ssoIframeContainer"
+                   src="/sam-sso/login?flowSessionId=...&appType=normal
+                        &userIp=...&userMac=...">
+         WebDriver 不会自动进 iframe，所以在顶层查就是 0 个输入框，
+         而回车 source 里也不含 iframe 的内容 —— 现象就是"页面明明有表单，
+         脚本却说没有"。
 
-    等的是"账号框和密码框都能认出来"，而不是"页面上有 input"：骨架页也可能
-    已经有 input，得等到真能认出字段才算好。等不到就按当前状态继续，
-    由调用方照常报 not_login_page —— 只是这次是等够了才报的。
+    好在 iframe 的 src 由门户自己填好（flowSessionId / userIp / userMac / nasIp
+    都是它生成的），我们只要切进去就行，不用自己拼参数。
+
+    切进去之后保持在该上下文：后续所有操作都在这个 frame 里做，
+    W3C 协议下元素引用和浏览上下文绑定，切来切去反而容易失效。
     """
     while True:
-        try:
-            f = _gather(driver, cfg)
-        except (_PageChanged, StaleElementReferenceException):
-            f = None                      # 正渲染到一半，下一轮再看
-        except WebDriverException as e:
-            log.debug("等表单时页面异常，按当前状态继续: %s", e)
-            return
-
-        if f is not None and f.username is not None and f.password is not None:
-            log.debug("登录表单已渲染出来")
+        if _context_has_login_form(driver, cfg):
             return
 
         if time.monotonic() >= deadline:
-            log.warning("等登录表单渲染超时，按当前页面状态继续")
+            log.warning("等登录表单超时（当前上下文里认不出账号框和密码框），按现状继续")
             return
+
+        # 当前上下文找不到，就把这一层的 iframe 逐个试一遍
+        try:
+            frames = driver.find_elements(By.TAG_NAME, "iframe")
+        except WebDriverException:
+            frames = []
+
+        for frame in frames:
+            try:
+                driver.switch_to.frame(frame)
+            except WebDriverException:
+                continue
+            if _context_has_login_form(driver, cfg):
+                log.info("登录表单在 iframe 里，已切进去")
+                return
+            try:
+                driver.switch_to.default_content()
+            except WebDriverException:
+                pass
+
         time.sleep(_SETTLE_STEP)
 
 
