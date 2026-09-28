@@ -26,11 +26,14 @@ import base64
 import html as html_module
 import logging
 import os
+import re
 import shutil
 import tempfile
 import time
 import urllib.parse
 from dataclasses import dataclass, field
+
+import requests
 
 from selenium import webdriver
 from selenium.common.exceptions import (
@@ -1001,18 +1004,96 @@ def _settle_and_dismiss_interstitial(driver, cfg) -> None:
     _wait_for_settle(driver, time.monotonic() + budget, budget)
 
 
+# 拦截页正文里可能藏着跳转，常见两种写法。
+_JS_REDIRECT_RE = re.compile(
+    r"""location\s*\.\s*(?:href\s*=\s*|replace\s*\(\s*)['"]([^'"]+)['"]""",
+    re.I,
+)
+_META_REFRESH_RE = re.compile(
+    r"""<meta[^>]+http-equiv\s*=\s*['"]?refresh['"]?[^>]+content\s*=\s*['"][^'"]*?url=([^'";>\s]+)""",
+    re.I,
+)
+
+
+def _url_from_body(text: str) -> str | None:
+    """从拦截页正文里抠出跳转地址。纯字符串判断，方便直接测。"""
+    if not text:
+        return None
+    for pattern in (_JS_REDIRECT_RE, _META_REFRESH_RE):
+        m = pattern.search(text)
+        if m:
+            return html_module.unescape(m.group(1))
+    return None
+
+
+def _discover_portal_url(cfg: Config) -> str | None:
+    """用一次不跟随重定向的 HTTP 请求，问出 AC 要把未认证的请求送去哪。
+
+    这是绕开 Chrome 强制门户提示页的关键。
+
+    背景：未认证时 AC 会拦截 HTTP 请求，回一个指向认证页的响应 —— 那个地址带着
+    **AC 生成的 flowParams**（会话参数），我们自己是造不出来的；直接访问门户会得到
+    "设备未注册"。而 Chrome 的提示页恰恰只在"访问外网"时弹。
+
+    所以：**用 Python 把地址要出来，再让浏览器直接打开这个内网地址**。门户是
+    内网地址（实测直接访问 10.71.29.181 时 Chrome 不弹提示页），整条提示页问题
+    就不存在了。
+
+    拿不到就返回 None，调用方退回"让浏览器去撞拦截"的老路。
+    """
+    for entry in cfg.probe_urls[:2]:
+        url = entry.get("url")
+        if not url:
+            continue
+        try:
+            r = requests.get(url, timeout=cfg.probe_timeout, allow_redirects=False)
+        except requests.RequestException as e:
+            log.debug("问重定向失败 %s: %s", url, e)
+            continue
+
+        location = r.headers.get("Location")
+        if location and 300 <= r.status_code < 400:
+            log.info("AC 把 %s 重定向到 %s", url, location)
+            return location
+
+        found = _url_from_body(r.text)
+        if found:
+            log.info("拦截页正文里的跳转地址: %s", found)
+            return found
+
+        # 用 INFO 记全：AC 未必用 302，也可能是 200 + 别的形状。把状态码、
+        # Content-Type 和正文开头都留下，下次它自然发生时日志直接说明要抠什么，
+        # 不用再翻失败转储。
+        log.info(
+            "%s 返回 HTTP %s（Content-Type=%s），没找到跳转地址；正文开头=%r",
+            url,
+            r.status_code,
+            r.headers.get("Content-Type", "(无)"),
+            r.text[:160],
+        )
+
+    return None
+
+
 def _navigate(driver, cfg: Config) -> bool:
     """打开登录页，返回这次导航是否超时。
 
-    目标地址优先用配置里的 login_url；没配就用第一条探测地址，让门户把浏览器
-    劫持到登录页去——这正是"不需要知道门户真实地址"的关键。
+    目标地址的优先级：
+      1. 配置里的 login_url
+      2. **先用 Python 问出 AC 的跳转地址**（内网地址，Chrome 不会拦）
+      3. 退而求其次，让浏览器去撞探测地址，指望 AC 把它劫持过去
     """
     if cfg.login_url:
         target = cfg.login_url
-    elif cfg.probe_urls:
-        target = cfg.probe_urls[0]["url"]
     else:
-        target = cfg.portal
+        target = _discover_portal_url(cfg)
+        if target:
+            log.info("改用问到的认证页地址，浏览器不会触发强制门户提示页")
+        elif cfg.probe_urls:
+            target = cfg.probe_urls[0]["url"]
+            log.info("问不到跳转地址，退回让浏览器访问探测地址")
+        else:
+            target = cfg.portal
 
     log.info("打开 %s", target)
     try:

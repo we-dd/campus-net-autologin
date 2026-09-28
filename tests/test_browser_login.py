@@ -1317,6 +1317,33 @@ def test_interstitial_detection_handles_empty_input():
     assert browser_login._looks_like_captive_portal_interstitial("", "") is False
 
 
+# ---- 从 AC 的拦截页里抠跳转地址 ----
+# 这是绕开 Chrome 强制门户提示页的关键：用 Python 问出认证页地址（带 AC 生成的
+# flowParams），再让浏览器直接打开内网地址 —— 提示页只在"访问外网"时弹。
+
+def test_extracts_js_location_href():
+    body = "<script>location.href='http://10.0.0.1/portal/auth?flowParams=abc'</script>"
+    assert browser_login._url_from_body(body) == "http://10.0.0.1/portal/auth?flowParams=abc"
+
+
+def test_extracts_js_location_replace_with_double_quotes():
+    body = 'top.location.replace("http://10.0.0.1/auth?x=1&amp;y=2")'
+    got = browser_login._url_from_body(body)
+    assert got == "http://10.0.0.1/auth?x=1&y=2"      # HTML 实体要还原成 &
+
+
+def test_extracts_meta_refresh():
+    body = '<meta http-equiv="refresh" content="0;url=http://10.0.0.1/portal/entry">'
+    assert browser_login._url_from_body(body) == "http://10.0.0.1/portal/entry"
+
+
+def test_url_from_body_returns_none_for_normal_pages():
+    """正常页面不能误抠出一个地址来 —— 那会让浏览器跳到莫名其妙的地方。"""
+    assert browser_login._url_from_body("<html><body>登录成功</body></html>") is None
+    assert browser_login._url_from_body("") is None
+    assert browser_login._url_from_body("<html><body>Microsoft Connect Test</body></html>") is None
+
+
 def _recorder(sink):
     """假的 captcha.recognize：把收到的图片字节记进 sink，并回一个非空结果。"""
     def _fake(png_bytes):
