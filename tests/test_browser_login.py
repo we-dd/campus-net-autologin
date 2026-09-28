@@ -1242,6 +1242,53 @@ def test_interstitial_detected_from_real_page():
     assert browser_login._looks_like_captive_portal_interstitial(title, body) is True
 
 
+def test_interstitial_detected_on_wired_network():
+    """有线网版本（原样抄自 2026-09-28 10:44 的失败转储）。
+
+    这一条曾经漏掉：Chrome 对无线网说「连接到 Wi-Fi 网络」，对有线的说
+    「连接到网络」，我按无线那版写的特征词，于是有线场景下压根没触发，
+    白跑了一轮。用户当时用的正是有线网。
+    """
+    title = "连接到网络"
+    body = (
+        "连接到网络 连接到网络 您正在使用的网络可能会要求您访问其登录页面。 "
+        "向 Google 发送 您访问的部分网页的网址、有限的系统信息以及部分网页内容 "
+        "隐私权政策 开启增强型保护 连接"
+    )
+    assert browser_login._looks_like_captive_portal_interstitial(title, body) is True
+
+
+def test_both_interstitial_variants_share_the_anchor_phrase():
+    """两种措辞都含「访问其登录页面」，这是最稳的锚点。
+
+    就算 Chrome 以后再改标题（比如换成「需要登录」「网络登录」），只要这句
+    还在就仍然认得出来。所以这个锚点必须单独测，不能只测标题。
+    """
+    assert browser_login._looks_like_captive_portal_interstitial(
+        "随便什么标题", "您需要访问其登录页面才能继续。"
+    ) is True
+    # 反过来：只有标题命中、正文没有锚点，也应认得（两条路任一即可）
+    assert browser_login._looks_like_captive_portal_interstitial(
+        "连接到网络", ""
+    ) is True
+
+
+def test_interstitial_detected_by_shape_without_relying_on_wording():
+    """结构识别：不看文案。
+
+    这条是防"文案又变了"的兜底 —— 2026-09-28 的教训就是按文案写太脆。
+    """
+    f = browser_login._looks_like_chrome_interstitial_by_shape
+    # Chrome 提示页：两个按钮都在，没有密码框
+    assert f(has_primary=True, has_details=True, has_password_input=False) is True
+    # 真正的登录页：就算碰巧有同名按钮，只要有密码框就不算提示页
+    assert f(has_primary=True, has_details=True, has_password_input=True) is False
+    # 只有一个按钮，不像提示页
+    assert f(has_primary=True, has_details=False, has_password_input=False) is False
+    assert f(has_primary=False, has_details=True, has_password_input=False) is False
+    assert f(has_primary=False, has_details=False, has_password_input=False) is False
+
+
 def test_interstitial_detected_for_english_variants():
     assert browser_login._looks_like_captive_portal_interstitial(
         "Connect to Wi-Fi network", "Your Wi-Fi network may require you to sign in."

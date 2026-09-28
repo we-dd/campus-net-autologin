@@ -805,12 +805,21 @@ def _quit(driver) -> None:
 # 把真正的登录页挡住。脚本看到的就是"有按钮、没有输入框"，于是判成
 # not_login_page 放弃 —— 2026-09-28 开机时实测踩到的就是这个。
 _CHROME_INTERSTITIAL_MARKERS = (
-    "连接到 wi-fi 网络",
+    # 有线网（实测 2026-09-28，标题就这四个字）
+    "连接到网络",
+    # 无线网
     "连接到 wi-fi",
     "登录到网络",
+    # 两种措辞都含这一句，是最稳的锚点：
+    #   无线：「您要使用的 Wi-Fi 网络（xxx）可能需要您访问其登录页面。」
+    #   有线：「您正在使用的网络可能会要求您访问其登录页面。」
+    "访问其登录页面",
+    # 英文版
+    "connect to network",
     "connect to wi-fi",
     "sign in to network",
-    "captive portal",
+    "sign in to the network",
+    "requires you to sign in",
 )
 
 
@@ -822,6 +831,22 @@ def _looks_like_captive_portal_interstitial(title: str, body_text: str) -> bool:
     """
     haystack = f"{title} {body_text}".lower()
     return any(marker in haystack for marker in _CHROME_INTERSTITIAL_MARKERS)
+
+
+def _looks_like_chrome_interstitial_by_shape(
+    has_primary: bool, has_details: bool, has_password_input: bool
+) -> bool:
+    """靠结构判断是不是 Chrome 的提示页，**完全不看文案**。
+
+    为什么需要这条：2026-09-28 就是只按无线版的措辞写了特征词，有线版
+    （「连接到网络」）没匹配上，白跑一轮。文案会变，Chrome 的按钮组合不会。
+
+    Chrome 的提示页固定带 primary-button（连接）和 details-button（详细信息），
+    而真正的登录页一定有密码框 —— 用"没有密码框"排除掉恰好有同名按钮的页面。
+
+    抽成纯函数是为了能直接测：驱动相关的部分跑不起来，判断逻辑可以。
+    """
+    return has_primary and has_details and not has_password_input
 
 
 def _dismiss_captive_portal_interstitial(driver) -> bool:
@@ -841,7 +866,27 @@ def _dismiss_captive_portal_interstitial(driver) -> bool:
         return False
 
     if not _looks_like_captive_portal_interstitial(title, body_text):
-        return False
+        # 文案没认出来。退一步看结构 —— 这条路不看文案，Chrome 改措辞也不会失效。
+        try:
+            has_details = bool(
+                driver.find_elements(By.CSS_SELECTOR, "button#details-button")
+            )
+            has_password = bool(
+                driver.find_elements(By.CSS_SELECTOR, "input[type=password]")
+            )
+        except WebDriverException:
+            return False
+
+        if not _looks_like_chrome_interstitial_by_shape(True, has_details, has_password):
+            log.debug("有 Chrome 提示页的主按钮，但文案和结构都不匹配，按普通页面处理")
+            return False
+
+        log.warning(
+            "文案没匹配上特征词，但结构上就是 Chrome 的提示页，按提示页处理；"
+            "标题=%r 正文开头=%r —— 建议把这句文案补进 _CHROME_INTERSTITIAL_MARKERS",
+            title[:60],
+            body_text[:120],
+        )
 
     try:
         button = driver.find_element(By.CSS_SELECTOR, "button#primary-button")
