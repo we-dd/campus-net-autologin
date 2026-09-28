@@ -6,7 +6,11 @@
   * 改代码立即生效，不需要重启任何东西
   * 不需要处理"开机时网络还没就绪"
 
-两个触发器：登录时 + 每 30 分钟一次。
+三个触发器：登录 Windows 时、每隔几分钟一次、网络状态变化时。
+
+间隔短是为了"网一掉就尽快恢复"，但登录失败后脚本自己会退避
+（见 config.json 的 retry_backoff_minutes），不会因为轮询快就把
+登录请求打密 —— 打太密会被学校的风控锁账号。
 
 用 pythonw.exe 而不是 python.exe：前者不弹黑色控制台窗口。
 （代价是看不到控制台输出，但日志本来就会写进 campus-net.log。）
@@ -26,7 +30,7 @@
 $ErrorActionPreference = "Stop"
 
 $TaskName   = "CampusNetAutoLogin"
-$EveryMins  = 30
+$EveryMins  = 5
 $TimeLimitM = 10      # 单次执行上限。登录最慢可能要一分钟，留足余量
 $Root       = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Script     = Join-Path $Root "login.py"
@@ -61,7 +65,7 @@ $Action = New-ScheduledTaskAction `
 # 触发器 1：登录时
 $T1 = New-ScheduledTaskTrigger -AtLogOn -User $User
 
-# 触发器 2：从现在起 2 分钟后开始，每 30 分钟一次。
+# 触发器 2：从现在起 2 分钟后开始，每 $EveryMins 分钟一次。
 # 故意不写 -RepetitionDuration：不指定持续时间的重复就是无限重复。
 # （写 [TimeSpan]::MaxValue 会被计划任务拒绝，说持续时间超出范围。）
 $T2 = New-ScheduledTaskTrigger `
@@ -72,7 +76,7 @@ $T2 = New-ScheduledTaskTrigger `
 # 触发器 3：网络状态一变就立刻跑一次。
 # PowerShell 5.1 没有对应的事件触发器 cmdlet，得用 CIM 手工构造。
 # 监听 NetworkProfile 的 10000（网络已连接），这样开机后网卡一就绪就马上检查，
-# 不用干等下一个 30 分钟节点。
+# 不用干等下一个轮询节点。
 #
 # 注意：它**不能**覆盖"被校园网踢下线"——那种情况发生在 AC 那边，网卡本身没变化，
 # Windows 不会发事件。被踢下线只能靠定时轮询兜住。

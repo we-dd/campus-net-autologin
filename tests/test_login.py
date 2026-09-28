@@ -90,6 +90,68 @@ def test_check_logs_in_when_portal_reachable_but_internet_is_not(tmp_path, monke
     assert len(calls) == 1
 
 
+def test_check_backs_off_after_a_recent_failure(tmp_path, monkeypatch):
+    """失败之后短时间内不再重试。
+
+    轮询间隔调短（5 分钟）是为了"网一掉就尽快恢复"，但如果登录一直在失败，
+    短间隔就变成密集地打认证服务器 —— 6 次失败半小时内攒完，反而更容易撞上
+    学校风控。退避让探测保持灵敏，同时把登录尝试的密度限住。
+    """
+    cfg, path = make_cfg(tmp_path)
+    now = 1_000_000.0
+    write_state(cfg, failures=[now - 60])          # 1 分钟前失败过
+    calls = []
+    monkeypatch.setattr(cli.time, "time", lambda: now)
+    patch_net(monkeypatch, probe.State.UNAUTHED)
+    patch_login(monkeypatch, Result(True, "success"), calls)
+
+    assert cli.main(["--check", "--config", path]) == 0
+    assert calls == []
+
+
+def test_check_retries_once_the_backoff_has_passed(tmp_path, monkeypatch):
+    """过了退避时间就正常重试 —— 别把退避写成永久停止。"""
+    cfg, path = make_cfg(tmp_path)
+    now = 1_000_000.0
+    write_state(cfg, failures=[now - (cfg.retry_backoff_minutes * 60 + 60)])
+    calls = []
+    monkeypatch.setattr(cli.time, "time", lambda: now)
+    patch_net(monkeypatch, probe.State.UNAUTHED)
+    patch_login(monkeypatch, Result(True, "success"), calls)
+
+    assert cli.main(["--check", "--config", path]) == 0
+    assert len(calls) == 1
+
+
+def test_backoff_does_not_block_the_already_online_shortcut(tmp_path, monkeypatch):
+    """已经在线时不受退避影响 —— 该清的失败计数还是要清。"""
+    cfg, path = make_cfg(tmp_path)
+    now = 1_000_000.0
+    write_state(cfg, failures=[now - 60])
+    calls = []
+    monkeypatch.setattr(cli.time, "time", lambda: now)
+    patch_net(monkeypatch, probe.State.ONLINE)
+    patch_login(monkeypatch, Result(True, "success"), calls)
+
+    assert cli.main(["--check", "--config", path]) == 0
+    assert state.load(cfg.state_path).failures == []
+
+
+def test_backoff_does_not_block_the_lockout_stop_message(tmp_path, monkeypatch):
+    """已进入"停止自动登录"状态时，仍然要弹提示 —— 退避不能把它遮掉。"""
+    cfg, path = make_cfg(tmp_path)
+    now = 1_000_000.0
+    write_state(cfg, failures=[now - 60], stopped=True)
+    calls = []
+    monkeypatch.setattr(cli.time, "time", lambda: now)
+    monkeypatch.setattr(cli, "_notify", lambda *a, **k: None)
+    patch_net(monkeypatch, probe.State.UNAUTHED)
+    patch_login(monkeypatch, Result(True, "success"), calls)
+
+    assert cli.main(["--check", "--config", path]) == 1
+    assert calls == []
+
+
 # --- 防锁号护栏 -------------------------------------------------------------
 
 
@@ -119,7 +181,9 @@ def test_check_logs_in_when_unauthenticated(tmp_path, monkeypatch):
 
 def test_successful_login_clears_the_failure_history(tmp_path, monkeypatch):
     cfg, path = make_cfg(tmp_path)
-    write_state(cfg, failures=[time.time()])
+    # 时间要往前推过退避期：这条测的是"登录成功后清空失败记录"，
+    # 写一个刚刚失败过的时间会被退避挡住，根本走不到登录那一步。
+    write_state(cfg, failures=[time.time() - (cfg.retry_backoff_minutes * 60 + 60)])
     patch_net(monkeypatch, probe.State.UNAUTHED)
     patch_login(monkeypatch, Result(True, "success"))
 

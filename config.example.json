@@ -1,19 +1,16 @@
 {
   "username": "你的学号",
   "portal": "http://10.71.29.181",
-
   "browser": "chrome",
   "headless": false,
   "login_url": "",
-
   "captcha_max_retry": 5,
   "run_max_fail": 3,
   "window_hours": 6,
   "window_max_fail": 6,
-
+  "retry_backoff_minutes": 15,
   "probe_timeout": 5,
   "log_level": "INFO",
-
   "probe_urls": [
     {
       "url": "http://www.msftconnecttest.com/connecttest.txt",
@@ -24,7 +21,6 @@
       "expect_status": 204
     }
   ],
-
   "selectors": {
     "username": "#nameInput",
     "password": "input[type=password]",

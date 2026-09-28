@@ -34,7 +34,7 @@ DEFAULT_PROBE_URLS: list[dict[str, Any]] = [
 # 校验就会一起失效，别做这个简化。
 _STR_FIELDS = ("log_level",)
 _INT_FIELDS = ("captcha_max_retry", "run_max_fail", "window_hours",
-               "window_max_fail", "probe_timeout")
+               "window_max_fail", "retry_backoff_minutes", "probe_timeout")
 _OPTIONAL_URL_FIELDS = ("login_page_url", "login_submit_url", "captcha_url")
 
 # browser 只认这两个。写 chrome 是为了 Edge 出问题时能换个浏览器试，
@@ -79,6 +79,13 @@ class Config:
     run_max_fail: int = 3
     window_hours: int = 6
     window_max_fail: int = 6
+    # 失败之后的退避：距上次失败不足这么多分钟就跳过本轮。
+    #
+    # 为什么需要它：计划任务的轮询间隔调短（比如 5 分钟）是为了"网一掉就尽快恢复"，
+    # 但如果登录一直在失败，短间隔就变成"每 5 分钟打一次认证服务器" —— 6 次失败会
+    # 在半小时内攒完，反而更容易撞上学校的风控。
+    # 有了退避：探测依然快，但**登录尝试的密度**被限住了。
+    retry_backoff_minutes: int = 15
     probe_timeout: int = 5
     log_level: str = "INFO"
     probe_urls: list[dict[str, Any]] = field(default_factory=lambda: [dict(u) for u in DEFAULT_PROBE_URLS])

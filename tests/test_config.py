@@ -264,7 +264,7 @@ def test_known_keys_are_exactly_the_documented_options():
     assert _KNOWN_KEYS == {
         "username", "portal", "probe_urls", "log_level",
         "captcha_max_retry", "run_max_fail", "window_hours",
-        "window_max_fail", "probe_timeout",
+        "window_max_fail", "retry_backoff_minutes", "probe_timeout",
         "login_page_url", "login_submit_url", "captcha_url",
         "browser", "headless", "login_url", "selectors",
     }

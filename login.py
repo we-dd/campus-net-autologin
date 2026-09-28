@@ -117,6 +117,22 @@ def run_check(cfg) -> int:
         )
         return 1
 
+    # 退避：失败之后不要立刻再试。
+    #
+    # 计划任务的轮询间隔调短是为了"网一掉就尽快恢复"，但如果登录一直在失败，
+    # 短间隔就变成密集地打认证服务器 —— 6 次失败半小时内攒完，反而更容易撞上
+    # 学校风控。退避让"探测"保持灵敏，同时把"登录尝试"的密度限住。
+    if st.failures:
+        since = now - max(st.failures)
+        cool = cfg.retry_backoff_minutes * 60
+        if since < cool:
+            log.info(
+                "距上次登录失败仅 %.0f 秒（退避 %d 分钟），本轮不重试",
+                since,
+                cfg.retry_backoff_minutes,
+            )
+            return 0
+
     log.info("检测到未认证，开始登录")
     return do_login(cfg, st, now)
 
