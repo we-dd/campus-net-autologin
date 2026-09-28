@@ -77,6 +77,12 @@ _SETTLE_TIMEOUT = 20.0
 # 所以既不计入 captcha_max_retry，也不消耗锁号预算。
 _STALE_RETRIES = 3
 
+# 提交成功之后，留在浏览器里等网络真正放行的预算。
+# 门户在 CAS 登录后还要再调一次接口开闸，那是页面发起的请求 ——
+# 关早了就把它掐断（见 _confirm_network_up）。
+_NETWORK_CONFIRM_TIMEOUT = 25.0
+_NETWORK_CONFIRM_STEP = 2.5
+
 # 失败现场转储的文件名前缀（配套的 .html / .png 在 .gitignore 里）
 _DUMP_PREFIX = "failure-"
 # 被抹掉的秘密用什么占位
@@ -1933,6 +1939,32 @@ def _dump_failure(driver, cfg: Config, password: str, reason: str) -> str:
     return text
 
 
+def _confirm_network_up(cfg: Config, deadline: float) -> bool:
+    """轮询网络，确认它真的通了。**此期间浏览器必须还开着。**
+
+    为什么需要它：我们判定"登录成功"的依据是页面上的密码框消失，但那只能说明
+    CAS 网页登录过了，不代表网络放行。2026-09-28 实测出现每 5 分钟重登一次的
+    循环：每轮都判成功、清空失败计数，下一轮又发现没网 —— 而用户手动登录后
+    网络才真的通。
+
+    最可能的原因是**浏览器关得太早**：门户在 CAS 登录之后还要再调一次接口去打开
+    网络准入（AC 的闸门），那是页面自己发起的请求，我们一关浏览器就把它掐断了。
+    所以提交成功后先别关，轮询到通为止。
+    """
+    from src import probe as _probe
+
+    while time.monotonic() < deadline:
+        try:
+            with requests.Session() as s:
+                s.trust_env = False          # 和 login.py 一样绕开系统代理
+                if _probe.check(cfg, s) is _probe.State.ONLINE:
+                    return True
+        except Exception as e:
+            log.debug("复探网络失败: %s", e)
+        time.sleep(_NETWORK_CONFIRM_STEP)
+    return False
+
+
 def _run(cfg: Config, password: str) -> Result:
     profile = tempfile.mkdtemp(prefix="campus-net-profile-")
     driver = None
@@ -1941,6 +1973,23 @@ def _run(cfg: Config, password: str) -> Result:
         nav_timed_out = _navigate(driver, cfg)
         _settle_and_dismiss_interstitial(driver, cfg)
         result = _attempt_loop(driver, cfg, password, nav_timed_out)
+
+        if result.ok:
+            # 页面说成功不算数 —— 网络真通了才算。**浏览器此时还不能关**，
+            # 见 _confirm_network_up 的说明。
+            if _confirm_network_up(cfg, time.monotonic() + _NETWORK_CONFIRM_TIMEOUT):
+                log.info("复探确认：网络已连通")
+            else:
+                log.error(
+                    "页面显示登录成功，但 %.0f 秒内网络仍未通 —— "
+                    "这次登录没有真正打开网络准入",
+                    _NETWORK_CONFIRM_TIMEOUT,
+                )
+                result = Result(
+                    False, "no_network_after_login",
+                    "页面显示登录成功，但网络未通（可能只认证了网页会话）",
+                )
+
         if not result.ok:
             # 失败现场必须在关掉浏览器之前落盘——关掉就什么都没有了。
             # 只在失败时落盘，成功的运行不该往用户目录里堆文件。

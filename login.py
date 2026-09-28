@@ -81,6 +81,15 @@ def do_login(cfg, st, now: float) -> int:
         state.save(st, cfg.state_path)
         return 1
 
+    if res.reason == "no_network_after_login":
+        # 页面说成功、网络却没通。这不能算成功 —— 算成功就会清空失败计数，
+        # 下一轮又发现没网、又登一次，形成每 5 分钟一次的循环（2026-09-28 实测）。
+        # 计入失败，让退避把重试密度压下来。
+        _notify("校园网认证", f"页面显示登录成功，但网络仍未通。\n{res.detail}")
+        state.record_failure(st, now, cfg.window_hours, cfg.window_max_fail)
+        state.save(st, cfg.state_path)
+        return 1
+
     state.record_failure(st, now, cfg.window_hours, cfg.window_max_fail)
     state.save(st, cfg.state_path)
     return 1
@@ -134,30 +143,9 @@ def run_check(cfg) -> int:
             return 0
 
     log.info("检测到未认证，开始登录")
-    rc = do_login(cfg, st, now)
-
-    # 登录报"成功"（页面上的密码框消失）**不等于网络真的通了**。
-    # 实测 2026-09-28 11:36 起出现过每 5 分钟就要重登一次的循环：
-    # 脚本每次判成功、清空失败计数，下一轮又发现没网，再登一次。
-    # 怀疑登录认证的是网页会话，而没有打开网络准入。
-    # 所以这里立刻复探一次，把真实结果写进日志 —— 有这一行，是"真的通了"
-    # 还是"只登进了网页"就一目了然，不用再靠用户手动登录来推断。
-    if rc == 0:
-        try:
-            with _new_session() as session:
-                after = probe.check(cfg, session)
-            if after is probe.State.ONLINE:
-                log.info("复探确认：网络确实已通")
-            else:
-                log.error(
-                    "复探发现问题：登录报成功，但网络仍是 %s —— "
-                    "这次登录很可能只认证了网页会话，没有打开网络准入",
-                    after.value,
-                )
-        except Exception as e:
-            log.warning("登录后复探失败: %s", e)
-
-    return rc
+    # "网络真的通了没通"由 browser_login 在**浏览器还开着**的时候确认
+    # （见 _confirm_network_up）—— 关早了会把门户开闸的请求掐断。这里不再复探。
+    return do_login(cfg, st, now)
 
 
 def run_login(cfg) -> int:
