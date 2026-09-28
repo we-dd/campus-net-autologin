@@ -3,7 +3,7 @@
   "portal": "http://10.71.29.181",
   "browser": "chrome",
   "headless": false,
-  "login_url": "",
+  "login_url": "http://10.71.29.181/portal/entry/pc/authenticate",
   "captcha_max_retry": 5,
   "run_max_fail": 3,
   "window_hours": 6,
