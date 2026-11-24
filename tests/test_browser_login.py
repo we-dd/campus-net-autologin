@@ -6,6 +6,7 @@
 这个切分是刻意的——门户改版时最先坏的就是这一层，而它恰好不需要浏览器就能测。
 """
 import logging
+import os
 import time
 from types import SimpleNamespace
 
@@ -38,6 +39,23 @@ from src.browser_login import (
     render_elements,
     render_overrides,
 )
+
+
+# 自动 fixture 会把模块属性换掉；下面测缓存本身的用例需要原始函数，
+# 所以在 fixture 生效之前先留一份引用。
+_real_cached_driver_path = browser_login._cached_driver_path
+
+
+@pytest.fixture(autouse=True)
+def _no_real_driver_cache(monkeypatch):
+    """默认不读本机的 Selenium 缓存，测试结果不能依赖开发机装了什么。
+
+    需要测缓存逻辑的用例在自己的函数体里再 setattr 覆盖。
+    """
+    monkeypatch.setattr(
+        browser_login, "_cached_driver_path",
+        lambda browser, cache_root=None: None,
+    )
 
 
 # --- 描述符构造 -------------------------------------------------------------
@@ -744,6 +762,189 @@ def test_build_driver_silences_the_loggers_that_would_leak_the_password(monkeypa
         root.setLevel(before)
 
 
+def test_page_load_timeout_is_not_the_http_probe_timeout(monkeypatch):
+    """打开认证页的等待上限不能用 cfg.probe_timeout。
+
+    2026-10-15 开机故障的根因就是这个：driver.get() 打开认证页，
+    12:09:55.006 开始、12:10:00.017 报"页面加载超时"，恰好 5.0 秒 —— 正是
+    probe_timeout 的默认值。文档根本没 commit，Chrome 停在"新标签页"上，
+    于是页面上 0 个表单元素，整轮以 timeout 放弃，用户只能手动连。
+
+    而同一个文件里 _SETTLE_TIMEOUT 的注释早就写明"门户劫持 + flowSessionId
+    跳转链 + Angular 启动实测比 5 秒慢得多"，唯独这一行还在复用 HTTP 探测的值。
+    """
+
+    class _FakeDriver:
+        def set_page_load_timeout(self, seconds):
+            self.timeout = seconds
+
+    made = {}
+
+    def _factory(options=None):
+        made["driver"] = _FakeDriver()
+        return made["driver"]
+
+    monkeypatch.setattr(browser_login.webdriver, "Edge", _factory)
+
+    browser_login._build_driver(
+        SimpleNamespace(browser="edge", headless=True, probe_timeout=7),
+        "C:/tmp/profile",
+    )
+
+    assert made["driver"].timeout == browser_login._PAGE_LOAD_TIMEOUT
+    assert made["driver"].timeout != 7, "别再用 HTTP 探测的超时打开认证页"
+
+
+# --- 本地驱动缓存：开机断网时别让 Selenium Manager 联网查版本 ------------------
+
+
+def test_cached_driver_path_picks_the_newest_matching_driver(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        browser_login, "_cached_driver_path", _real_cached_driver_path,
+    )
+    for version in ("154.0.8037.57", "156.0.8001.10", "156.0.8078.47", "999.0.1"):
+        d = tmp_path / "chromedriver" / "win64" / version
+        d.mkdir(parents=True)
+        (d / "chromedriver.exe").write_text("")
+
+    got = browser_login._cached_driver_path("chrome", tmp_path, browser_major=156)
+
+    assert got is not None
+    assert got.endswith("156.0.8078.47" + os.sep + "chromedriver.exe")
+
+
+def test_cached_driver_path_falls_back_to_a_mismatched_driver(tmp_path, monkeypatch):
+    """没有匹配主版本的驱动时，用手上最新的去试，而不是干脆不给。
+
+    2026-11-24 实测：Chrome 升到 157、缓存里只有 156，而 ChromeDriver 156 带
+    Chrome 157 完全正常（会话能建、DOM 能读）。硬性拒绝反而让每次启动都去问
+    Selenium Manager —— 刚唤醒、网络"半通"时那次联网卡了 90 秒，用户等不及，
+    自己手动登的。真正该做的是把匹配的驱动放进缓存，而不是在这里卡住。
+    """
+    monkeypatch.setattr(
+        browser_login, "_cached_driver_path", _real_cached_driver_path,
+    )
+    for version in ("154.0.8037.57", "156.0.8078.47"):
+        d = tmp_path / "chromedriver" / "win64" / version
+        d.mkdir(parents=True)
+        (d / "chromedriver.exe").write_text("")
+
+    got = browser_login._cached_driver_path("chrome", tmp_path, browser_major=157)
+
+    assert got is not None
+    assert got.endswith("156.0.8078.47" + os.sep + "chromedriver.exe")
+
+
+def test_cached_driver_path_returns_none_when_cache_is_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        browser_login, "_cached_driver_path", _real_cached_driver_path,
+    )
+    assert browser_login._cached_driver_path("chrome", tmp_path) is None
+    # 不认识的浏览器不去猜目录
+    assert browser_login._cached_driver_path("firefox", tmp_path) is None
+
+
+def test_build_driver_uses_the_cached_driver(monkeypatch, tmp_path):
+    """有缓存就把它交给 Service，别让 DriverFinder 再去调 Selenium Manager。
+
+    DriverFinder._binary_paths 里写得很直白：service.path 非空 =>
+    "Skipping Selenium Manager"。开机断网时省掉的正是那次联网查版本。
+    """
+    cached = tmp_path / "chromedriver.exe"
+    cached.write_bytes(b"")
+    monkeypatch.setattr(
+        browser_login, "_cached_driver_path", lambda browser: str(cached),
+    )
+    seen = {}
+
+    class _FakeDriver:
+        def set_page_load_timeout(self, seconds):
+            pass
+
+    def _factory(options=None, service=None):
+        seen["service"] = service
+        return _FakeDriver()
+
+    monkeypatch.setattr(browser_login.webdriver, "Chrome", _factory)
+
+    browser_login._build_driver(
+        SimpleNamespace(browser="chrome", headless=True), "C:/tmp/profile",
+    )
+
+    assert seen["service"] is not None
+    assert seen["service"].path == str(cached)
+
+
+def test_build_driver_falls_back_when_the_cached_driver_fails(
+    monkeypatch, tmp_path,
+):
+    """缓存里的驱动和刚升级的浏览器不匹配时，退回 Selenium Manager 的老路。"""
+    cached = tmp_path / "chromedriver.exe"
+    cached.write_bytes(b"")
+    monkeypatch.setattr(
+        browser_login, "_cached_driver_path", lambda browser: str(cached),
+    )
+    calls = []
+
+    class _FakeDriver:
+        def set_page_load_timeout(self, seconds):
+            pass
+
+    def _factory(options=None, service=None):
+        calls.append(service)
+        if service is not None:
+            raise WebDriverException("session not created: version mismatch")
+        return _FakeDriver()
+
+    monkeypatch.setattr(browser_login.webdriver, "Chrome", _factory)
+
+    browser_login._build_driver(
+        SimpleNamespace(browser="chrome", headless=True), "C:/tmp/profile",
+    )
+
+    assert len(calls) == 2
+    assert calls[0] is not None and calls[0].path == str(cached)
+    assert calls[1] is None
+
+
+def test_context_form_check_is_one_dom_query():
+    """判断"这是不是登录页"只发一次 JS 查询，不逐个描述元素。
+
+    实测门户顶层 44 个表单类元素，逐个描述要 1.27 秒；这个检查在等 Angular
+    插入 iframe 时会反复调用，所以必须便宜。
+    """
+    calls = []
+
+    class _Driver:
+        def find_elements(self, by, value):
+            calls.append(("find", value))
+            return []
+
+        def execute_script(self, script):
+            calls.append(("js", script))
+            return True
+
+    assert browser_login._context_has_login_form(
+        _Driver(), SimpleNamespace(selectors={}),
+    ) is True
+    assert [kind for kind, _ in calls] == ["js"]
+
+
+def test_context_form_check_prefers_configured_selectors():
+    """配了选择器就先按选择器认，和 _gather 的覆盖逻辑一致。"""
+    class _Driver:
+        def find_elements(self, by, value):
+            return [object()]
+
+        def execute_script(self, script):
+            raise AssertionError("选择器已经命中，不该再跑 JS")
+
+    assert browser_login._context_has_login_form(
+        _Driver(),
+        SimpleNamespace(selectors={"username": "#u", "password": "#p"}),
+    ) is True
+
+
 def test_describe_output_feeds_locate():
     """把 _describe 的输出直接喂给 locate。
 
@@ -1160,6 +1361,51 @@ def test_collect_is_fine_when_nothing_goes_stale():
     assert not any(d.get("stale") for d in descriptors)
 
 
+def test_collect_takes_elements_and_attributes_in_one_js_call():
+    """44 个元素逐个读属性要 1.27 秒；一次 JS 调用把元素和属性一起取回。
+
+    元素引用和描述符来自同一个数组，index 不会错位。
+    """
+    els = [object(), object()]
+    rows = [
+        {"el": els[0], "tag": "input", "type": "text", "id": "u", "name": "",
+         "class": "", "placeholder": "", "value": "", "src": "", "text": "",
+         "nearby": "", "visible": True, "w": 140, "h": 21},
+        {"el": els[1], "tag": "input", "type": "password", "id": "p", "name": "",
+         "class": "", "placeholder": "", "value": "", "src": "", "text": "",
+         "nearby": "", "visible": True, "w": 140, "h": 21},
+    ]
+    calls = []
+
+    class _Driver:
+        def execute_script(self, script, *args):
+            calls.append(args)
+            return rows
+
+        def find_elements(self, by, value):
+            raise AssertionError("不该逐元素采集")
+
+    elements, descriptors = browser_login._collect(_Driver())
+
+    assert elements == els
+    assert [d["index"] for d in descriptors] == [0, 1]
+    assert descriptors[0]["size"] == (140, 21)
+    assert descriptors[1]["type"] == "password"
+    assert calls == [(browser_login._FORM_SELECTOR,)]
+
+
+def test_collect_falls_back_when_the_bulk_query_is_rejected():
+    """JS 被禁用/注入失败时不能直接登录不了，退回逐元素采集。"""
+    class _Driver:
+        def execute_script(self, script, *args):
+            raise WebDriverException("blocked")
+
+        def find_elements(self, by, value):
+            return []
+
+    assert browser_login._collect(_Driver()) == ([], [])
+
+
 def test_still_attached_asks_the_document():
     """用一次 JS 调用判断句柄还挂着没有，比重新采集一遍便宜得多。"""
     assert browser_login._still_attached(
@@ -1542,6 +1788,34 @@ def test_stale_retry_does_not_consume_a_captcha_attempt(monkeypatch, caplog):
     assert "不计入验证码重试次数" in caplog.text
 
 
+def test_nav_timeout_flag_is_only_passed_to_the_first_attempt(monkeypatch):
+    """nav_timed_out 只能影响第 1 次尝试，之后必须强制 False。
+
+    nav_timed_out 原本是一整轮一次性捕获的（_run 里 _navigate 只调一次），
+    _prepare 用它把"找不到表单"分成 timeout / not_login_page 两种 reason。
+    可这个循环只在 captcha_failed 时才继续，而 captcha_failed 提交前（验证码
+    没认出来）和提交后（judge 没过）都会产生 —— 于是第 2 次尝试可能发生在
+    **上一次已经 POST 过凭据**之后，那时页面自然会变、找不到表单，若还带着
+    nav_timed_out=True 就会被报成 timeout。
+
+    而 timeout 是"一个凭据都没提交"的凭据：login.py 靠它决定不计入锁号窗口、
+    不触发退避。报错了就等于给锁号预算漏账，所以这条必须钉住。
+    """
+    seen = []
+
+    def fake_attempt(driver, cfg, password, nav_timed_out, attempt):
+        seen.append(nav_timed_out)
+        return browser_login.Result(False, "captcha_failed", "验证码不对"), None, None
+
+    monkeypatch.setattr(browser_login, "_attempt", fake_attempt)
+    monkeypatch.setattr(browser_login, "_refresh_captcha", lambda *a: None)
+
+    cfg = SimpleNamespace(captcha_max_retry=3)
+    browser_login._attempt_loop(object(), cfg, "pw", True)
+
+    assert seen == [True, False, False]
+
+
 # --- 失败现场转储（密码绝不落盘）--------------------------------------------
 
 
@@ -1629,3 +1903,83 @@ def test_dump_failure_survives_a_driver_that_cannot_read_anything(tmp_path):
     note = browser_login._dump_failure(_BrokenDriver(), cfg, "pw", "browser_error")
 
     assert "失败现场" in note
+
+
+# --- Chrome 网络错误页：唤醒后网卡在抖，别当成"门户改版" ---------------------
+
+
+def test_network_error_page_is_recognized_by_its_error_code():
+    """2026-10-28 21:00 实测到的真实页面文案，原样拿来做用例。"""
+    code = browser_login._looks_like_network_error_page(
+        "www.msftconnecttest.com",
+        "您的连接已中断\n检测到了网络变化。\nERR_NETWORK_CHANGED",
+    )
+
+    assert code == "ERR_NETWORK_CHANGED"
+
+
+def test_an_ordinary_login_page_is_not_a_network_error_page():
+    assert browser_login._looks_like_network_error_page(
+        "校园网认证", "学号 密码 验证码 登录 记住密码",
+    ) is None
+
+
+def test_recover_reloads_until_the_network_error_page_goes_away(monkeypatch):
+    """网络稳住之后要自己重新加载出来，不能对着错误页干等一整个超时。"""
+    monkeypatch.setattr(browser_login, "_NETWORK_ERROR_RETRY_STEP", 0)
+
+    class _Driver:
+        def __init__(self):
+            self.refreshes = 0
+
+        @property
+        def title(self):
+            return "www.msftconnecttest.com"
+
+        def execute_script(self, script, *a):
+            if self.refreshes < 2:
+                return "您的连接已中断\nERR_NETWORK_CHANGED"
+            return "学号 密码"
+
+        def refresh(self):
+            self.refreshes += 1
+
+    driver = _Driver()
+
+    assert browser_login._recover_network_error(driver) is None
+    assert driver.refreshes == 2
+
+
+def test_recover_gives_up_after_the_retry_budget(monkeypatch):
+    """一直恢复不了就别无限刷新，交给上层按 network_unstable 处理。"""
+    monkeypatch.setattr(browser_login, "_NETWORK_ERROR_RETRY_STEP", 0)
+
+    class _Driver:
+        def __init__(self):
+            self.refreshes = 0
+
+        title = "www.msftconnecttest.com"
+
+        def execute_script(self, script, *a):
+            return "ERR_NETWORK_CHANGED\n检测到了网络变化。"
+
+        def refresh(self):
+            self.refreshes += 1
+
+    driver = _Driver()
+
+    assert browser_login._recover_network_error(driver) == "ERR_NETWORK_CHANGED"
+    assert driver.refreshes == browser_login._NETWORK_ERROR_RETRIES
+
+
+def test_recover_does_not_touch_a_normal_page():
+    class _Driver:
+        title = "校园网认证"
+
+        def execute_script(self, script, *a):
+            return "学号 密码"
+
+        def refresh(self):
+            raise AssertionError("正常页面不该被重新加载")
+
+    assert browser_login._recover_network_error(_Driver()) is None

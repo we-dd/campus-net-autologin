@@ -44,3 +44,12 @@ def test_ocr_model_is_loaded_only_once():
     first = captcha._get_ocr()
     captcha.recognize(_png())
     assert captcha._get_ocr() is first
+
+
+def test_warm_up_never_raises(monkeypatch):
+    """后台预热失败不能把整轮登录带崩——识别时还会按需再试一次。"""
+    def _boom():
+        raise RuntimeError("模型文件读不了")
+
+    monkeypatch.setattr(captcha, "_get_ocr", _boom)
+    captcha.warm_up()  # 不抛异常即通过

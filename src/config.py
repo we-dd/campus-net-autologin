@@ -34,7 +34,8 @@ DEFAULT_PROBE_URLS: list[dict[str, Any]] = [
 # 校验就会一起失效，别做这个简化。
 _STR_FIELDS = ("log_level",)
 _INT_FIELDS = ("captcha_max_retry", "run_max_fail", "window_hours",
-               "window_max_fail", "retry_backoff_minutes", "probe_timeout")
+               "window_max_fail", "retry_backoff_minutes", "probe_timeout",
+               "portal_wait_probes")
 _OPTIONAL_URL_FIELDS = ("login_page_url", "login_submit_url", "captcha_url")
 
 # browser 只认这两个。写 chrome 是为了 Edge 出问题时能换个浏览器试，
@@ -87,6 +88,20 @@ class Config:
     # 有了退避：探测依然快，但**登录尝试的密度**被限住了。
     retry_backoff_minutes: int = 15
     probe_timeout: int = 5
+    # 探到"门户不可达"之后，隔一段时间再探几次。
+    #
+    # 为什么需要它：门户不可达有两种截然不同的原因 —— "不在校园网"和"刚开机/刚唤醒，
+    # 网卡还没就绪"。原来的代码一律当成前者，直接 return 0 什么都不做。2026-10-15
+    # 开机实测就是这么栽的：12:09:45 判"门户不可达"，**4 秒后门户就可达了**，
+    # 于是紧接着那次运行才有机会去登录（还因为别的 bug 失败了），用户干等到 12:13。
+    # 重探本身几乎不花钱：探测只发 HTTP、不起浏览器，实测一次门户不可达的整轮只要 56ms。
+    #
+    # 次数而不是秒数：调用方 login.py 用固定次数循环，不依赖时钟，测试里把
+    # _PORTAL_REPROBE_STEP 置 0 就能跑得很快。
+    #
+    # 12 次 × 5 秒 = 最长等 60 秒。间隔从 15 秒压到 5 秒是为了"唤醒后尽快动手"：
+    # 2026-10-17 实测唤醒到联网用了 36 秒，其中 15 秒就是这个固定等待。
+    portal_wait_probes: int = 12
     log_level: str = "INFO"
     probe_urls: list[dict[str, Any]] = field(default_factory=lambda: [dict(u) for u in DEFAULT_PROBE_URLS])
 
@@ -98,6 +113,14 @@ class Config:
     # 看到它在做什么，出问题时也能立刻发现。
     browser: str = "edge"
     headless: bool = False
+
+    # 已经在线时，顺手把本地 chromedriver 对齐到本机 Chrome 的版本
+    # （见 src/driver_update.py）。
+    #
+    # 默认开着：Chrome 每四周左右自动升级一次，驱动落后一个主版本通常还能跑，
+    # 跨两个就直接 session not created。而"能下载驱动的时候没在登录、要登录的
+    # 时候没网"这个死结，只有趁**已经在线**的那一轮补，才有解。
+    auto_update_driver: bool = True
 
     # 运营商（服务）名称。留空表示不做这一步。
     #
@@ -366,6 +389,13 @@ def load(path: str = "config.json") -> Config:
     if "service" in data:
         # 留空合法，表示不做"选运营商"这一步。
         kwargs["service"] = _require_str(data, "service", where).strip()
+
+    if "auto_update_driver" in data:
+        if not isinstance(data["auto_update_driver"], bool):
+            raise _bad_type(
+                where, "auto_update_driver", "布尔值", data["auto_update_driver"]
+            )
+        kwargs["auto_update_driver"] = data["auto_update_driver"]
 
     if "login_url" in data:
         # 留空合法，表示"打开探测地址、让门户把浏览器劫持到登录页"，这是默认行为。

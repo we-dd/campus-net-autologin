@@ -4,6 +4,8 @@ __pycache__/
 samples/
 secret.dat
 state.json
+driver-update.json
+driver-update.lock
 campus-net.log
 campus-net.log.1
 failure-*.html

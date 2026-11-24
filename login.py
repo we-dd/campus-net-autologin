@@ -7,7 +7,8 @@
   python login.py --setup          交互式保存密码
   python login.py --dump-form      打开登录页，打印页面上的输入框/图片/按钮
 
-退出码：0 已在线或登录成功；1 登录失败；2 配置或环境错误。
+退出码：0 已在线或登录成功；1 未能上网（登录失败，或仍在失败退避窗口内）；
+        2 配置或环境错误。
 """
 from __future__ import annotations
 
@@ -20,10 +21,17 @@ import time
 
 import requests
 
-from src import browser_login, logsetup, probe, secret, state
+from src import browser_login, driver_update, logsetup, probe, secret, state
 from src.config import ConfigError, load
 
 log = logging.getLogger(__name__)
+
+# 两次"门户不可达"重探之间的间隔秒数（重探几次由 cfg.portal_wait_probes 决定）。
+# 5 秒是实测出来的：唤醒后 Wi-Fi 通常几秒内就绪，15 秒会让整个登录白白晚 10 秒；
+# 再往下压（1-3 秒）收益很小，反而在真正断网时多打几次 HTTP。
+# 测试里置 0：本项目的测试从不 patch time.sleep，而是把这类间隔常量清零
+# （browser_login 的 _SETTLE_STEP 就是这个约定）。
+_PORTAL_REPROBE_STEP = 5.0
 
 
 def _notify(title: str, message: str) -> None:
@@ -52,6 +60,38 @@ def _new_session() -> requests.Session:
     return s
 
 
+def _probe(cfg) -> probe.State:
+    """探测一次。每次都用新 session，和原来的写法一致。"""
+    with _new_session() as session:
+        return probe.check(cfg, session)
+
+
+def _probe_until_portal_ready(cfg) -> probe.State:
+    """探到"门户不可达"时，隔一会儿再探几次，而不是立刻放弃。
+
+    "门户不可达"有两种截然不同的原因：不在校园网（没插网线 / 没连 SCITWiFi），
+    和刚开机 / 刚唤醒（网卡还没就绪）。原来的代码一律当成前者，直接 return 0
+    什么都不做。2026-10-15 开机实测就是这么栽的：12:09:45 判"门户不可达"，
+    4 秒后门户就可达了 —— 那次机会白白丢掉了。
+
+    重探几乎不花钱：探测只发 HTTP、不起浏览器，实测一次门户不可达的整轮只要 56ms。
+    真不在校园网时，代价也只是几次探测加几段等待，不会碰认证服务器。
+    """
+    net = _probe(cfg)
+    if net is not probe.State.PORTAL_DOWN:
+        return net
+
+    for i in range(1, cfg.portal_wait_probes + 1):
+        time.sleep(_PORTAL_REPROBE_STEP)
+        net = _probe(cfg)
+        if net is not probe.State.PORTAL_DOWN:
+            log.info("门户已就绪（第 %d 次重探）", i)
+            return net
+
+    log.warning("门户仍然不可达（已重探 %d 次）", cfg.portal_wait_probes)
+    return net
+
+
 def do_login(cfg, st, now: float) -> int:
     """调一次浏览器登录，并按结果更新状态文件。
 
@@ -66,6 +106,22 @@ def do_login(cfg, st, now: float) -> int:
         state.save(st, cfg.state_path)
         return 0
 
+    # 失败后立刻复探一次再下结论。
+    #
+    # 从探测到浏览器真正打开登录页，中间隔着 Chrome 启动和页面加载，开机时这段
+    # 可能有几十秒。2026-10-17 12:24 开机实测：探测时外网还不通，等浏览器起来时
+    # 网络已经自己恢复了；浏览器打开探测地址当然找不到登录表单，这次运行就被判成
+    # not_login_page 并记进退避窗口，而机器其实已经在线。
+    # 本项目的唯一成功标准是"外网能不能出去"（见 src/probe.py），所以以复探为准。
+    if _probe(cfg) is probe.State.ONLINE:
+        log.warning(
+            "登录未完成 (%s)，但复探确认网络已通，按成功处理: %s",
+            res.reason, res.detail,
+        )
+        state.clear(st)
+        state.save(st, cfg.state_path)
+        return 0
+
     log.error("登录失败 (%s): %s", res.reason, res.detail)
 
     if res.reason == "secret":
@@ -73,6 +129,28 @@ def do_login(cfg, st, now: float) -> int:
         # （计了会触发"账号要被锁了"的假警报），按环境错误退出 2。
         _notify("校园网认证", f"本地密码文件不可用，无法自动登录。\n{res.detail}")
         return 2
+
+    if res.reason == "timeout":
+        # 认证页压根没加载出来（表单没找到），这一轮**一个凭据都没提交**。
+        # 依据见 browser_login._attempt_loop：nav_timed_out 只传给第 1 次尝试，
+        # 而第 1 次一放弃整个循环就返回，所以这条 reason 严格等价于
+        # "没有打到认证服务器" —— 和上面的 secret 同类。
+        #
+        # 因此不计入锁号窗口，也不触发退避：退避是按"失败过"来压重试密度的，
+        # 而这里根本没有失败可言。真记进去的话，一次页面加载慢就会把接下来
+        # 15 分钟的重试全部挡掉 —— 开机的场景恰恰等不起这 15 分钟。
+        #
+        # 退出码仍给 1：这次运行确实没连上网，该如实上报。
+        _notify("校园网认证", f"认证页没加载出来，没有提交任何凭据。\n{res.detail}")
+        return 1
+
+    if res.reason == "network_unstable":
+        # 浏览器停在它自己的网络错误页上（典型场景：刚唤醒，网卡还在反复重连），
+        # 这一轮**一个凭据都没提交** —— 和上面的 timeout 同类。
+        # 不计入锁号窗口，也不触发退避：一次一秒钟的抖动不该把接下来 15 分钟的
+        # 重试全挡掉（2026-10-28 实测就是这么被挡掉的）。退出码照样给 1。
+        _notify("校园网认证", f"页面停在浏览器的网络错误页，没有提交任何凭据。\n{res.detail}")
+        return 1
 
     if res.reason == "bad_credentials":
         # 确定性失败：再试没有意义，只会加速锁号。但它确实消耗了锁号预算，要计入。
@@ -101,13 +179,13 @@ def run_check(cfg) -> int:
     st = state.load(cfg.state_path)
     state.prune(st, now, cfg.window_hours)
 
-    with _new_session() as session:
-        net = probe.check(cfg, session)
+    net = _probe_until_portal_ready(cfg)
 
     if net is probe.State.ONLINE:
         state.clear(st)
         state.save(st, cfg.state_path)
         log.info("已在线，无需操作")
+        _maybe_update_driver(cfg)
         return 0
 
     if net is probe.State.PORTAL_DOWN:
@@ -135,12 +213,19 @@ def run_check(cfg) -> int:
         since = now - max(st.failures)
         cool = cfg.retry_backoff_minutes * 60
         if since < cool:
-            log.info(
+            log.warning(
                 "距上次登录失败仅 %.0f 秒（退避 %d 分钟），本轮不重试",
                 since,
                 cfg.retry_backoff_minutes,
             )
-            return 0
+            # 这里返回 1 而不是 0。
+            #
+            # 本轮确实什么都没做，但"什么都没做"的原因是：上一次登录失败了，而网络
+            # 到现在还没通。返回 0 等于告诉计划任务"这轮一切正常"，会把上一轮的失败
+            # 从任务列表里覆盖掉。2026-10-24 的驱动版本故障就是这么被藏了将近 4 个
+            # 小时的：任务状态一直显示成功（最后结果是 15:40:06 那轮退避跳过的 0），
+            # 真正的 ERROR 在 15:40:02 那次运行里，已经被下一轮盖掉了。
+            return 1
 
     log.info("检测到未认证，开始登录")
     # "网络真的通了没通"由 browser_login 在**浏览器还开着**的时候确认
@@ -185,6 +270,42 @@ def run_dump_form(cfg) -> int:
     return 0 if res.ok else 1
 
 
+def run_update_driver(cfg) -> int:
+    """--update-driver：把本地驱动对齐到本机 Chrome。
+
+    手动入口，所以 force=True：用户既然敲了这条命令，就不要拿"冷却中"挡他。
+    """
+    res = driver_update.update_if_needed(cfg, force=True)
+    if res.ok:
+        print(res.detail)
+        return 0
+    print(res.detail, file=sys.stderr)
+    return 1
+
+
+def _maybe_update_driver(cfg) -> None:
+    """已经在线时，顺手把驱动对齐到本机 Chrome 的版本。
+
+    时机是刻意选的：这一轮已经确认在线，下载走的是真实外网，不缺网、也不和
+    登录抢时间。反过来，真需要登录的那些轮次恰恰是没网的时候，那时下载必然失败
+    （2026-10-23 就是卡在这个死结上）。
+
+    任何异常都只记日志：驱动更新失败绝不能影响"这一轮已经在线"这个结论，
+    更不能把 run_check 的返回值改掉。
+    """
+    if not getattr(cfg, "auto_update_driver", True):
+        return
+    try:
+        res = driver_update.update_if_needed(cfg)
+    except Exception:
+        log.exception("检查驱动版本时出错（忽略）")
+        return
+    if res.changed:
+        log.info("驱动已自动更新：%s", res.detail)
+    elif not res.ok:
+        log.warning("驱动自动更新未完成：%s", res.detail)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="login.py", description="校园网自动认证",
@@ -195,13 +316,15 @@ def main(argv=None) -> int:
     parser.add_argument("--setup", action="store_true", help="交互式保存密码")
     parser.add_argument("--dump-form", action="store_true",
                         help="打开登录页并打印页面元素，用于校准 selectors")
+    parser.add_argument("--update-driver", action="store_true",
+                        help="把本地 chromedriver 更新到与本机 Chrome 匹配的版本")
     parser.add_argument("--config", default=None,
                         help="配置文件路径，默认脚本同目录下的 config.json")
     parser.add_argument("--verbose", action="store_true", help="输出 DEBUG 日志")
 
     args = parser.parse_args(argv)
 
-    if not any([args.check, args.login, args.setup, args.dump_form]):
+    if not any([args.check, args.login, args.setup, args.dump_form, args.update_driver]):
         parser.print_help()
         return 2
 
@@ -232,6 +355,8 @@ def main(argv=None) -> int:
             return run_setup(cfg)
         if args.dump_form:
             return run_dump_form(cfg)
+        if args.update_driver:
+            return run_update_driver(cfg)
         if args.login:
             return run_login(cfg)
         return run_check(cfg)

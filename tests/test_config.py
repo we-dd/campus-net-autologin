@@ -34,6 +34,7 @@ def test_load_applies_defaults(tmp_path):
     assert cfg.window_hours == 6
     assert cfg.window_max_fail == 6
     assert cfg.probe_timeout == 5
+    assert cfg.portal_wait_probes == 12
     assert cfg.log_level == "INFO"
     assert cfg.probe_urls == DEFAULT_PROBE_URLS
 
@@ -178,7 +179,7 @@ def test_utf8_bom_file_loads(tmp_path):
 @pytest.mark.parametrize(
     "field",
     ["captcha_max_retry", "run_max_fail", "window_hours",
-     "window_max_fail", "probe_timeout"],
+     "window_max_fail", "probe_timeout", "portal_wait_probes"],
 )
 def test_bool_for_int_field_raises(tmp_path, field):
     with pytest.raises(ConfigError, match=field):
@@ -265,8 +266,9 @@ def test_known_keys_are_exactly_the_documented_options():
         "username", "portal", "probe_urls", "log_level",
         "captcha_max_retry", "run_max_fail", "window_hours",
         "window_max_fail", "retry_backoff_minutes", "probe_timeout",
+        "portal_wait_probes",
         "login_page_url", "login_submit_url", "captcha_url",
-        "browser", "headless", "service", "login_url", "selectors",
+        "browser", "headless", "auto_update_driver", "service", "login_url", "selectors",
     }
 
 

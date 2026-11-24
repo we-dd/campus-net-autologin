@@ -29,9 +29,11 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import requests
 
@@ -44,9 +46,11 @@ from selenium.common.exceptions import (
     WebDriverException,
 )
 from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.edge.options import Options as EdgeOptions
+from selenium.webdriver.edge.service import Service as EdgeService
 
 from src import captcha, secret
 from src.config import Config
@@ -72,6 +76,15 @@ _SETTLE_SAMPLES = 3
 # （默认 5 秒），而"门户劫持 + flowSessionId 跳转链 + Angular 启动"实测比它慢得多。
 # 只在"确实要登录"这条路上花这个时间，等到了就立刻继续。
 _SETTLE_TIMEOUT = 20.0
+
+# driver.get() 打开认证页时的等待上限。**不能**复用 cfg.probe_timeout（默认 5 秒）：
+# 那是给 HTTP 探测用的，理由和上面 _SETTLE_TIMEOUT 完全相同 —— 门户劫持 + 跳转链 +
+# Angular 启动比 5 秒慢得多。2026-10-15 开机实测：12:09:55.006 打开认证页，
+# 12:10:00.017 就报"页面加载超时"，恰好 5.0 秒，文档根本没 commit，Chrome 停在
+# "新标签页"上，于是页面上 0 个表单元素、整轮以 timeout 放弃。
+# 这里给足和稳定预算一样的 20 秒：超时了 _navigate 也只是记一笔继续走（见 _navigate），
+# 所以放宽只会让"本来就慢的门户"有机会加载出来，不会多提交任何东西。
+_PAGE_LOAD_TIMEOUT = 20.0
 
 # 一轮尝试里，因为页面重渲染而重来的次数上限。这类失败**没有提交任何东西**，
 # 所以既不计入 captcha_max_retry，也不消耗锁号预算。
@@ -101,6 +114,7 @@ REASONS = (
     "captcha_failed",   # 验证码错，或新验证码换了一张，可以再试
     "not_login_page",   # 找不到登录表单；或验证码只找到一半，需要人工校准
     "timeout",          # 打开页面超时，且页面上也没有登录表单
+    "network_unstable", # 页面停在浏览器自己的网络错误页（刚唤醒、网卡还在抖）
     "browser_error",    # 浏览器/驱动本身的故障
     "bad_credentials",  # 页面明确提示账号或密码错：确定性失败，重试只会加速锁号
     "secret",           # 本地密码文件读不出来，根本没发出登录请求
@@ -706,16 +720,133 @@ def _describe(el) -> dict:
         return {"index": -1, "stale": True}
 
 
+# 一次 JS 调用采集整页表单元素：既返回元素引用（el），也返回它的描述符。
+#
+# 原来的写法是 find_elements 之后对每个元素调 _describe：每个元素要读
+# size/tag/id/name/class/placeholder/value/src/text/可见性，约 10 次 WebDriver
+# 往返。真实门户 44 个元素、约 440 次往返，实测 1.27 秒。
+#
+# Selenium 的 execute_script 支持返回值里嵌套 DOM 元素引用，于是可以在同一个
+# JS 任务里把"元素 + 属性"一起取回来：既省往返，又因为 JS 是同步执行的，
+# 不会出现"采到一半页面重渲染"的错位。
+_COLLECT_JS = """
+var styleCache = new Map();
+function styleOf(node) {
+  if (!styleCache.has(node)) styleCache.set(node, window.getComputedStyle(node));
+  return styleCache.get(node);
+}
+function isVisible(el) {
+  // 和 WebDriver 的 is_displayed 对齐。实测 ChromeDriver 会把下面这些都判成
+  // 不可见：display:none、visibility:hidden/collapse、content-visibility:hidden、
+  // 自身或任一祖先 opacity:0、宽或高为 0。
+  var node = el;
+  while (node && node.nodeType === 1) {
+    var s = styleOf(node);
+    if (s.display === 'none' || s.visibility === 'hidden' ||
+        s.visibility === 'collapse' || s.contentVisibility === 'hidden') return false;
+    var op = parseFloat(s.opacity);
+    if (!isNaN(op) && op === 0) return false;
+    node = node.parentElement;
+  }
+  var r = el.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+}
+var nodes = document.querySelectorAll(arguments[0]);
+var out = [];
+for (var i = 0; i < nodes.length; i++) {
+  var el = nodes[i];
+  var tag = (el.tagName || '').toLowerCase();
+  // type 用 DOM 属性而不是 getAttribute：<input> 不写 type 时属性是 null、
+  // 属性值是 "text"；<button> 不写时属性值是 "submit"。WebDriver 的
+  // get_attribute('type') 返回的正是这个属性值，这里必须跟它一致。
+  var type = '';
+  if (typeof el.type === 'string') {
+    type = el.type.toLowerCase();
+  } else {
+    type = (el.getAttribute('type') || '').toLowerCase();
+  }
+  var visible = isVisible(el);
+  var text = '';
+  if (visible) {
+    text = (el.innerText || el.textContent || '').trim();
+  }
+  var nearby = '';
+  if (tag === 'input' && type === 'checkbox') {
+    var node = el;
+    for (var n = 0; n < 2; n++) {
+      node = node.parentElement;
+      if (!node) break;
+      var t = (node.innerText || node.textContent || '').trim();
+      if (t) { nearby = t; break; }
+    }
+  }
+  var value = '';
+  if (tag === 'input' || tag === 'textarea' || tag === 'select') {
+    value = (el.value === null || el.value === undefined) ? '' : String(el.value);
+  } else {
+    value = el.getAttribute('value') || '';
+  }
+  // img 的 src 用 DOM 属性（绝对地址），和 WebDriver 的 get_attribute('src') 一致。
+  var src = '';
+  if (tag === 'img') {
+    src = el.src || el.getAttribute('src') || '';
+  } else {
+    src = el.getAttribute('src') || '';
+  }
+  var rect = el.getBoundingClientRect();
+  out.push({
+    el: el,
+    tag: tag,
+    type: type,
+    id: el.getAttribute('id') || '',
+    name: el.getAttribute('name') || '',
+    'class': el.getAttribute('class') || '',
+    placeholder: el.getAttribute('placeholder') || '',
+    value: value,
+    src: src,
+    text: text,
+    nearby: nearby,
+    visible: visible,
+    w: Math.round(rect.width),
+    h: Math.round(rect.height)
+  });
+}
+return out;
+"""
+
+
 def _collect(driver) -> tuple[list, list[dict]]:
     """按文档顺序采集表单元素，返回 (elements, descriptors) 两个平行列表。
 
-    一次 find_elements 用逗号选择器拿到的就是文档顺序，所以描述符里的 index 同时
-    也是 elements 里的下标，"离谁最近"这类判断可以直接跨标签比。
+    优先用一次 JS 调用取回全部元素和属性（见 _COLLECT_JS）。JS 不可用时退回
+    逐元素 _describe：慢 100 倍，但至少还能登录。
 
-    采集中途发现任何元素失效（页面重渲染）就抛 _PageChanged：这时的 descriptors
+    描述符里的 index 同时也是 elements 里的下标，"离谁最近"这类判断可以直接
+    跨标签比。JS 路径里两者来自同一个数组，不会错位。
+
+    旧路径采集中途发现元素失效（页面重渲染）就抛 _PageChanged：那时的 descriptors
     是残缺的（失效的那些属性全空），拿它去判断"这是不是登录页"会得出错误结论。
-    实测第一次真机运行就是这么崩的——错误结论比崩溃更难查，所以宁可重来一轮。
     """
+    rows = None
+    try:
+        candidate = driver.execute_script(_COLLECT_JS, _FORM_SELECTOR)
+        if isinstance(candidate, list):
+            rows = candidate
+        else:
+            log.debug("批量采集没有返回列表（%s），退回逐元素采集", type(candidate).__name__)
+    except WebDriverException as e:
+        log.debug("批量采集失败，退回逐元素采集: %s", e)
+
+    if rows is not None:
+        elements = []
+        descriptors = []
+        for index, row in enumerate(rows):
+            elements.append(row.pop("el"))
+            row["size"] = (row.pop("w"), row.pop("h"))
+            row["index"] = index
+            descriptors.append(row)
+        return elements, descriptors
+
     elements = driver.find_elements(By.CSS_SELECTOR, _FORM_SELECTOR)
     descriptors = []
     for index, el in enumerate(elements):
@@ -759,6 +890,164 @@ def _silence_selenium_logging() -> None:
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
+# Selenium Manager 下载过的驱动放在这个缓存里（Windows/Linux/macOS 同构）：
+#   <cache>/<chromedriver|msedgedriver>/<平台>/<版本>/<可执行文件>
+_DRIVER_CACHE = {
+    "chrome": ("chromedriver", "chromedriver.exe"),
+    "edge": ("msedgedriver", "msedgedriver.exe"),
+}
+
+# 浏览器主版本的来源，按可靠性排序。
+# 注册表 BLBeacon 是 Chromium 系自己安装/升级后写进去的，比扫安装目录更准：
+# 安装目录里可能同时留着升级前的旧版本目录，BLBeacon 永远指向真正在跑的那个。
+_BROWSER_VERSION_REGISTRY = {
+    "chrome": (r"Software\Google\Chrome\BLBeacon", "version"),
+    "edge": (r"Software\Microsoft\Edge\BLBeacon", "version"),
+}
+
+_BROWSER_INSTALL_SUBDIR = {
+    "chrome": (r"Google\Chrome\Application",),
+    "edge": (r"Microsoft\Edge\Application",),
+}
+
+_BROWSER_BASE_ENVS = ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA")
+
+
+def _major_from_text(text: str) -> int | None:
+    """从 "156.0.8078.47" 这种版本串里取出主版本号 156。"""
+    nums = re.findall(r"\d+", text or "")
+    return int(nums[0]) if nums else None
+
+
+_VERSION_TEXT_RE = re.compile(r"^\d+(?:\.\d+){1,3}$")
+
+
+def _version_key(text: str) -> tuple[int, ...]:
+    """把 "156.0.8078.47" 变成可以比大小的元组。"""
+    return tuple(int(x) for x in re.findall(r"\d+", text or ""))
+
+
+def _browser_version(browser: str) -> str | None:
+    """查本机装着的那个浏览器的完整版本号（如 157.0.8103.80）；查不到返回 None。
+
+    注册表 BLBeacon 是 Chromium 系自己安装/升级后写进去的，比扫安装目录更准：
+    安装目录里可能同时留着升级前的旧版本目录，BLBeacon 永远指向真正在跑的那个。
+
+    返回完整版本而不是主版本：驱动自动更新（src/driver_update.py）要知道"该下
+    哪个构建"，光有主版本不够。
+    """
+    if os.name != "nt":
+        # 非 Windows 上浏览器可能是 snap/flatpak 装的，路径五花八门，猜不准。
+        return None
+
+    reg = _BROWSER_VERSION_REGISTRY.get(browser)
+    if reg:
+        try:
+            import winreg
+        except ImportError:  # pragma: no cover - Windows 上不会发生
+            winreg = None
+        if winreg is not None:
+            key_path, value_name = reg
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                try:
+                    with winreg.OpenKey(hive, key_path) as key:
+                        raw, _ = winreg.QueryValueEx(key, value_name)
+                except OSError:
+                    continue
+                text = str(raw).strip()
+                if _VERSION_TEXT_RE.match(text):
+                    return text
+
+    for base in (os.environ.get(name) for name in _BROWSER_BASE_ENVS):
+        if not base:
+            continue
+        for sub in _BROWSER_INSTALL_SUBDIR.get(browser, ()):
+            root = Path(base) / sub
+            try:
+                found = [
+                    p.name for p in root.iterdir()
+                    if p.is_dir() and _VERSION_TEXT_RE.match(p.name)
+                ]
+            except OSError:
+                continue
+            if found:
+                return max(found, key=_version_key)
+    return None
+
+
+def _browser_major_version(browser: str) -> int | None:
+    """查本机装着的那个浏览器的主版本号；查不到返回 None。
+
+    为什么要单独查这一个人：驱动和浏览器版本不匹配时（Chrome 自动升级之后），
+    Selenium 抛的是一条几十行的 Stacktrace，真正有用的只有 "only supports Chrome
+    version 154" 那一句。提前比一次主版本号，"缓存里的驱动过期了"就能在启动浏览器
+    之前变成一行看得懂的 WARNING。
+    """
+    return _major_from_text(_browser_version(browser) or "")
+
+
+def _cached_driver_path(
+    browser: str,
+    cache_root: Path | None = None,
+    browser_major: int | None = None,
+) -> str | None:
+    """找 Selenium Manager 已经下载到本地缓存的驱动，找不到返回 None。
+
+    优先挑主版本和当前浏览器一致的；一个都没有时**退而求其次用最新的**，
+    而不是直接返回 None —— 主版本差一个通常照样能用，硬性拒绝只会把每次启动
+    都推给 Selenium Manager 联网，反而慢。见下面 2026-11-24 的实测记录。
+
+    为什么要自己找：Selenium Manager 每次启动浏览器前都要联网查 known-good
+    versions，网络没就绪时（开机、刚唤醒）这一步会卡到超时，然后才回退到缓存。
+    2026-10-17 12:24 开机实测：12:24:56 开始启动 Chrome，直到 12:26:15 才打开
+    认证页，中间约 80 秒没有任何日志 —— 用户就是在这段时间手动登上的。
+
+    Selenium 的 DriverFinder 写明：Service.path 非空就直接使用，不再调用
+    Selenium Manager。所以把缓存路径交给它，就能完全绕开这次联网。
+    """
+    spec = _DRIVER_CACHE.get(browser)
+    if not spec:
+        return None
+    folder, exe = spec
+    root = cache_root or (Path.home() / ".cache" / "selenium")
+    candidates = list((root / folder).glob(f"*/*/{exe}"))
+    if not candidates:
+        return None
+
+    # 主版本一致只是"优先"，不是"必须"。
+    #
+    # 2026-10-24 那次（Chrome 154→156，缓存 154）确实硬失败了，所以一度改成"版本
+    # 不一致就拒绝"。但 2026-11-24 实测反过来打脸：**ChromeDriver 156 带 Chrome
+    # 157 完全正常** —— 会话能建，DOM 能读，标题、正文、元素全都对。
+    # 而"硬性拒绝 + 交给 Selenium Manager 联网"的代价很具体：刚唤醒、网络处于
+    # "半通"状态时那次联网会卡满 87~90 秒（实测 20:21:57 → 20:23:24），用户等
+    # 不及只能自己手动登。既然最后还是要用这个"不匹配"的驱动，就别绕这一圈。
+    #
+    # 真正该做的是把匹配的驱动放进缓存（联网时手动放一份即可，见使用说明），
+    # 这里只负责：有匹配的就先用匹配的，没有就用手上最新的去试 —— 起不来还有
+    # _build_driver 里的 WebDriverException 兜底。
+    if browser_major is None:
+        browser_major = _browser_major_version(browser)
+    if browser_major is not None:
+        matched = [
+            p for p in candidates
+            if _major_from_text(p.parent.name) == browser_major
+        ]
+        if matched:
+            candidates = matched
+        else:
+            log.warning(
+                "缓存里没有匹配浏览器主版本 %d 的 %s 驱动（现有: %s）；"
+                "先用现有的试，起不来再让 Selenium Manager 联网解析",
+                browser_major,
+                browser,
+                "、".join(sorted({p.parent.name for p in candidates})),
+            )
+
+    # 目录名形如 154.0.8037.57；没有数字的目录排在最后面。
+    return str(max(candidates, key=lambda p: _version_key(p.parent.name)))
+
+
 def _build_driver(cfg: Config, profile: str):
     """启动浏览器。
 
@@ -796,8 +1085,25 @@ def _build_driver(cfg: Config, profile: str):
     log.info("启动 %s 浏览器（临时配置目录 %s，headless=%s）",
              cfg.browser, profile, cfg.headless)
 
-    driver = factory(options=options)
-    driver.set_page_load_timeout(cfg.probe_timeout)
+    # 有本地缓存就直接用，别让 Selenium Manager 在开机断网时联网查版本。
+    # 缓存驱动和浏览器版本不匹配时（浏览器刚升级）启动会抛 WebDriverException，
+    # 这时再退回原路径，让 Selenium Manager 自己决定下载/回退。
+    cached = _cached_driver_path(cfg.browser)
+    if cached:
+        log.info("使用本地缓存的驱动 %s（跳过 Selenium Manager 联网检查）", cached)
+        service_cls = ChromeService if cfg.browser == "chrome" else EdgeService
+        try:
+            driver = factory(
+                options=options,
+                service=service_cls(executable_path=cached),
+            )
+        except WebDriverException as e:
+            log.warning("本地驱动启动失败，回退到 Selenium Manager: %s", e)
+            driver = factory(options=options)
+    else:
+        driver = factory(options=options)
+
+    driver.set_page_load_timeout(_PAGE_LOAD_TIMEOUT)
     return driver
 
 
@@ -857,6 +1163,101 @@ def _looks_like_chrome_interstitial_by_shape(
     抽成纯函数是为了能直接测：驱动相关的部分跑不起来，判断逻辑可以。
     """
     return has_primary and has_details and not has_password_input
+
+
+# Chrome 网络错误页的错误码。
+#
+# 这类页面和"门户改版了"在结构上完全一样：没有输入框、没有密码框、只有一两个
+# 按钮。但含义相反 —— 后者要人工校准 selectors，前者只需要再加载一次。
+#
+# 2026-10-28 21:00 实测：笔记本从睡眠恢复，网卡在 21:00:55~21:01:10 之间连着
+# 切了 6 次状态，浏览器恰好在 21:00:58 发起导航，被 ERR_NETWORK_CHANGED 掐断。
+# 网络 14 秒后就恢复了，可 Chrome 会一直停在这张错误页上（它不会自己重载），
+# 脚本干等 26 秒后判成 not_login_page，还记了一次失败、退避 15 分钟 —— 一秒钟
+# 的抖动换来整轮放弃。
+_NETWORK_ERROR_CODES = (
+    "ERR_NETWORK_CHANGED",
+    "ERR_INTERNET_DISCONNECTED",
+    "ERR_NETWORK_ACCESS_DENIED",
+    "ERR_ADDRESS_UNREACHABLE",
+    "ERR_CONNECTION_REFUSED",
+    "ERR_CONNECTION_RESET",
+    "ERR_CONNECTION_CLOSED",
+    "ERR_CONNECTION_TIMED_OUT",
+    "ERR_TIMED_OUT",
+    "ERR_NAME_NOT_RESOLVED",
+)
+
+# 认出网络错误页之后重新加载几次、每次隔多久。
+# 6 秒 × 3 次 = 18 秒，刚好覆盖上面实测的抖动窗口（约 15 秒）；再长就是在白白
+# 拖慢"真的没网"这种情形的判断。
+_NETWORK_ERROR_RETRIES = 3
+_NETWORK_ERROR_RETRY_STEP = 6.0
+
+
+def _looks_like_network_error_page(title: str, body_text: str) -> str | None:
+    """页面里有没有 Chrome 网络错误页的错误码？有就把它返回。
+
+    抽成纯函数是为了能直接测：驱动部分跑不起来，但"认不认得出这张页面"本身
+    就是字符串判断，可以拿实测到的真实文案来验。
+    """
+    haystack = f"{title}\n{body_text}".upper()
+    for code in _NETWORK_ERROR_CODES:
+        if code in haystack:
+            return code
+    return None
+
+
+def _detect_network_error(driver) -> str | None:
+    """当前页是不是 Chrome 的网络错误页？是就返回错误码。
+
+    只读 body 的 innerText：neterror 页上错误码就明文写在正文里，一次脚本往返
+    就能拿到，不用去依赖 .error-code 这个在部分版本上并不存在的元素。
+    """
+    try:
+        title = driver.title or ""
+        body = driver.execute_script(
+            "return document.body ? document.body.innerText : ''"
+        ) or ""
+    except WebDriverException as e:
+        log.debug("读取页面正文失败（可能正在跳转）: %s", e)
+        return None
+    return _looks_like_network_error_page(title, str(body))
+
+
+def _recover_network_error(driver) -> str | None:
+    """页面停在 Chrome 网络错误页上时，重新加载，给它几次机会。
+
+    恢复成功（或本来就不是错误页）返回 None，否则返回最后看到的错误码。
+
+    为什么值得单独重试：**探测通过不代表网络已经稳了**。探测只是一次 HTTP
+    请求，它能在网卡抖动的间隙成功；而浏览器的整页导航要跨越"发起 → 渲染完成"，
+    这期间任何一次网络状态变化都会让它直接抛 ERR_NETWORK_CHANGED。
+    """
+    code = _detect_network_error(driver)
+    if code is None:
+        return None
+
+    for i in range(1, _NETWORK_ERROR_RETRIES + 1):
+        log.warning(
+            "页面停在 Chrome 的网络错误页（%s），网络多半还没稳；第 %d/%d 次重新加载",
+            code, i, _NETWORK_ERROR_RETRIES,
+        )
+        time.sleep(_NETWORK_ERROR_RETRY_STEP)
+        try:
+            driver.refresh()
+        except TimeoutException:
+            # 连错误页都刷新超时，说明网卡确实还没就绪，下一轮再看。
+            log.debug("重新加载超时，按当前页面状态继续")
+        except WebDriverException as e:
+            log.debug("重新加载失败: %s", e)
+        code = _detect_network_error(driver)
+        if code is None:
+            log.info("网络错误页已恢复（第 %d 次重新加载后），继续登录", i)
+            return None
+
+    log.error("重新加载 %d 次后仍停在网络错误页（%s）", _NETWORK_ERROR_RETRIES, code)
+    return code
 
 
 def _drain_alert(driver) -> str | None:
@@ -1047,12 +1448,21 @@ def _discover_portal_url(cfg: Config) -> str | None:
 
     拿不到就返回 None，调用方退回"让浏览器去撞拦截"的老路。
     """
+    # 和 login.py 的探测、以及下面那个 --no-proxy-server 的 Chrome 保持一致：
+    # 绕开系统代理。这台机器上通常开着本地代理（Clash 之类），走代理问到的
+    # 可能是代理自己的响应，而不是 AC 的拦截页 —— 那就永远抠不到跳转地址。
+    with requests.Session() as session:
+        session.trust_env = False
+        return _discover_portal_url_in(cfg, session)
+
+
+def _discover_portal_url_in(cfg: Config, session) -> str | None:
     for entry in cfg.probe_urls[:2]:
         url = entry.get("url")
         if not url:
             continue
         try:
-            r = requests.get(url, timeout=cfg.probe_timeout, allow_redirects=False)
+            r = session.get(url, timeout=cfg.probe_timeout, allow_redirects=False)
         except requests.RequestException as e:
             log.debug("问重定向失败 %s: %s", url, e)
             continue
@@ -1461,13 +1871,52 @@ def _submit(driver, f: _Fields) -> None:
         _press_enter(f.password)
 
 
+# 当前上下文里有没有"可见的账号框 + 密码框"。只需要一次 DOM 查询。
+# 之前这里走 _gather：每个元素单独读 size/id/name/class/placeholder/value/text/
+# 可见性（约 10 次 WebDriver 往返）。真实门户顶层 44 个表单类元素，一次判断
+# 1.27 秒；而这个函数在等 Angular 插入 iframe 时会被反复调用，时间成倍放大。
+_HAS_LOGIN_FORM_JS = """
+var inputs = document.querySelectorAll('input');
+var hasUser = false, hasPwd = false;
+for (var i = 0; i < inputs.length; i++) {
+  var el = inputs[i];
+  var r = el.getBoundingClientRect();
+  var st = window.getComputedStyle(el);
+  if (r.width <= 0 || r.height <= 0 ||
+      st.visibility === 'hidden' || st.display === 'none') continue;
+  var t = (el.getAttribute('type') || '').toLowerCase();
+  if (t === 'password') { hasPwd = true; }
+  else if (t === '' || t === 'text' || t === 'tel' || t === 'email') { hasUser = true; }
+  if (hasUser && hasPwd) return true;
+}
+return false;
+"""
+
+
 def _context_has_login_form(driver, cfg: Config) -> bool:
-    """当前浏览上下文里能不能认出账号框和密码框。认不出就说明还没到登录页。"""
+    """当前上下文里有没有"可见的账号框 + 密码框"。认不出就说明还没到登录页。
+
+    只需要回答"有没有"，不关心元素长什么样，所以这里不发几十次 WebDriver 请求，
+    一次 JS 查询就够了。
+
+    配置了 username/password 选择器时先用它 —— 和 _gather 的覆盖逻辑一致，
+    也照顾了启发式认不出的自定义控件。
+    """
+    user_sel = cfg.selectors.get("username")
+    pwd_sel = cfg.selectors.get("password")
+    if user_sel and pwd_sel:
+        try:
+            if (driver.find_elements(By.CSS_SELECTOR, user_sel)
+                    and driver.find_elements(By.CSS_SELECTOR, pwd_sel)):
+                return True
+        except WebDriverException:
+            # 选择器不合法就退回 DOM 启发式，别让一次配置错误把登录卡死。
+            pass
+
     try:
-        f = _gather(driver, cfg)
-    except (_PageChanged, StaleElementReferenceException, WebDriverException):
+        return bool(driver.execute_script(_HAS_LOGIN_FORM_JS))
+    except WebDriverException:
         return False
-    return f.username is not None and f.password is not None
 
 
 def _wait_for_login_form(driver, cfg: Config, deadline: float) -> None:
@@ -1527,7 +1976,13 @@ def _prepare(driver, cfg: Config, password: str, nav_timed_out: bool,
     这一段里遇到 stale 是安全的：什么都没有提交，重来一轮不会重复打认证服务器，
     也不消耗 captcha_max_retry。
     """
-    _wait_until_ready(driver, cfg, time.monotonic() + _SETTLE_TIMEOUT, _SETTLE_TIMEOUT)
+    # 第 1 轮不用再等稳定：调用方 _run 已经走过 _settle_and_dismiss_interstitial，
+    # 中间没有任何导航。实测这一遍重复等待固定要 1.5 秒（4 次采样 × 0.5 秒）。
+    # 第 2 轮起页面刚刷新过验证码 / 重渲染过，必须重新等。
+    if attempt > 1:
+        _wait_until_ready(
+            driver, cfg, time.monotonic() + _SETTLE_TIMEOUT, _SETTLE_TIMEOUT,
+        )
 
     # 就绪不等于渲染完：Angular 单页应用还要水合。不等这一步会在骨架页上采集到
     # 0 个输入框，然后被误判成"不是登录页"。
@@ -1538,6 +1993,19 @@ def _prepare(driver, cfg: Config, password: str, nav_timed_out: bool,
     if f.username is None or f.password is None:
         detail = _missing_detail(f.controls, f.images,
                                  f.username is not None, f.password is not None)
+        # 先排除"这根本就是 Chrome 的网络错误页"。它和门户改版长得一模一样
+        # （都是 0 个输入框），但处理方式正好相反：这个只要下次再加载，而且
+        # 一个凭据都没提交 —— 不该记失败、更不该退避 15 分钟。
+        net_error = _detect_network_error(driver)
+        if net_error is not None:
+            log.error(
+                "第 %d 次尝试放弃: 页面是 Chrome 的网络错误页（%s）",
+                attempt, net_error,
+            )
+            return _Outcome(give_up=Result(
+                False, "network_unstable",
+                f"页面是 Chrome 的网络错误页（{net_error}），不是登录页：{detail}",
+            ))
         # 表单没找到：如果这次导航本来就超时了，那更该按超时报告——
         # 否则用户会去查"是不是登录页变了"，而真正的原因只是页面没加载完。
         reason = "timeout" if nav_timed_out else "not_login_page"
@@ -1798,6 +2266,18 @@ def _attempt_loop(driver, cfg: Config, password: str, nav_timed_out: bool) -> Re
 
     次数上限是这里最重要的安全属性：学校连续失败会锁账号，所以无论如何都不会
     多试一次，也不会在两次之间做无谓的重复尝试。
+
+    nav_timed_out 只传给**第 1 次**尝试，之后一律传 False。它本来是整轮一次性
+    捕获的（见 _run：_navigate 只调一次），而 _prepare 用它把"找不到表单"分成
+    timeout / not_login_page 两种 reason。问题是这个循环只在 captcha_failed 时
+    继续，而 captcha_failed 提交前（验证码没认出来）和提交后（judge 没过）都会
+    产生 —— 也就是说第 2 次尝试可能发生在**上一次已经 POST 过凭据**之后，那时
+    页面自然会变、找不到表单，可 nav_timed_out 还是 True，就会把它报成 timeout。
+
+    而 timeout 是"没有提交任何东西"的凭据（login.py 靠它决定不计入锁号窗口和
+    退避），所以这里必须收紧：只有第 1 次尝试紧跟 _navigate、且它一旦放弃本循环
+    就返回（reason != captcha_failed），"第 1 次 + 找不到表单"才真的等于
+    "这一轮一个凭据都没提交"。第 ≥2 次落回 not_login_page，照旧记账、照旧退避。
     """
     attempts = max(1, cfg.captcha_max_retry)
     image_el = None
@@ -1809,7 +2289,8 @@ def _attempt_loop(driver, cfg: Config, password: str, nav_timed_out: bool) -> Re
             # 换一张验证码再试（优先点"换一个"控件，点图片会被它拦掉）
             _refresh_captcha(driver, reload_el, image_el)
 
-        last, image_el, reload_el = _attempt(driver, cfg, password, nav_timed_out, attempt)
+        nav = nav_timed_out if attempt == 1 else False
+        last, image_el, reload_el = _attempt(driver, cfg, password, nav, attempt)
 
         if last.ok:
             log.info("登录成功（第 %d/%d 次尝试）", attempt, attempts)
@@ -2065,13 +2546,30 @@ def _confirm_network_up(cfg: Config, deadline: float) -> bool:
 
 
 def _run(cfg: Config, password: str) -> Result:
+    # 验证码模型 common.onnx 有 51.6 MB，冷启动读它要几秒；浏览器启动、页面稳定、
+    # 表单采集加起来也要好几秒。让模型在后台线程里先加载，等真需要识别时通常已经
+    # 就绪。失败只记 DEBUG，recognize() 到时候还会按需再试。
+    threading.Thread(
+        target=captcha.warm_up, daemon=True, name="ddddocr-warmup",
+    ).start()
+
     profile = tempfile.mkdtemp(prefix="campus-net-profile-")
     driver = None
     try:
         driver = _build_driver(cfg, profile)
         nav_timed_out = _navigate(driver, cfg)
-        _settle_and_dismiss_interstitial(driver, cfg)
-        result = _attempt_loop(driver, cfg, password, nav_timed_out)
+
+        # 唤醒后网卡会抖十几秒，浏览器整页导航撞上这段就会停在 Chrome 自己的
+        # 网络错误页上。先给它几次重新加载的机会，别急着判"不是登录页"。
+        network_error = _recover_network_error(driver)
+        if network_error is not None:
+            result = Result(
+                False, "network_unstable",
+                f"页面停在 Chrome 的网络错误页（{network_error}），没有提交任何凭据",
+            )
+        else:
+            _settle_and_dismiss_interstitial(driver, cfg)
+            result = _attempt_loop(driver, cfg, password, nav_timed_out)
 
         if result.ok:
             # 页面说成功不算数 —— 网络真通了才算。**浏览器此时还不能关**，

@@ -16,6 +16,15 @@ class FakeResponse:
         if self.status_code >= 400:
             raise requests.HTTPError(f"{self.status_code}", response=self)
 
+    # 驱动下载走的是流式读取（见 src/driver_update._download），
+    # 替身也得有这两个方法，否则测试根本走不到真实的下载路径。
+    def iter_content(self, chunk_size=8192):
+        for i in range(0, len(self.content), chunk_size):
+            yield self.content[i:i + chunk_size]
+
+    def close(self):
+        pass
+
 
 class FakeSession:
     """按 URL（或 URL 前缀）匹配预置响应，避免单元测试碰真实网络。

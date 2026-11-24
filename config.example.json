@@ -3,6 +3,7 @@
   "portal": "http://10.71.29.181",
   "browser": "chrome",
   "headless": true,
+  "auto_update_driver": true,
   "service": "中国电信",
   "login_url": "",
   "captcha_max_retry": 5,
@@ -11,6 +12,7 @@
   "window_max_fail": 6,
   "retry_backoff_minutes": 15,
   "probe_timeout": 5,
+  "portal_wait_probes": 12,
   "log_level": "INFO",
   "probe_urls": [
     {
